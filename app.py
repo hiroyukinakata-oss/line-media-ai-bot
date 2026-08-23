@@ -1,5 +1,8 @@
 import os
 import threading
+import json
+import urllib.request
+from urllib.parse import urlparse
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -24,20 +27,57 @@ configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
+def extract_x_text(url: str) -> str:
+    """XのURLから投稿テキストを直接抽出する（API制限回避の裏技）"""
+    try:
+        parsed_url = urlparse(url)
+        if parsed_url.netloc in ["twitter.com", "x.com", "www.twitter.com", "www.x.com"]:
+            api_url = f"https://api.vxtwitter.com{parsed_url.path}"
+            req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response:
+                data = json.loads(response.read().decode())
+                text = data.get("text", "")
+                return text
+    except Exception:
+        return ""
+    return ""
+
 def async_process_ai(user_id: str, url: str):
-    prompt = f"""
-    以下のコンテンツURLについて、内容を分かりやすく要約・解説してください。
-    URL: {url}
+    # XのURLだった場合、専用機能でテキストを抽出する
+    extracted_text = extract_x_text(url)
 
-    【1. 全体エグゼクティブサマリー】
-    メインテーマと結論を3〜4行で簡潔にまとめてください。
+    if extracted_text:
+        # Xからテキスト抽出成功した場合のプロンプト
+        prompt = f"""
+        以下のX（旧Twitter）の投稿内容（英語の場合は正確に和訳）を読み取り、以下の構成で分かりやすく要約・解説してください。
 
-    【2. 重要ポイント詳細解説】
-    主要な論点、背景、手法、事実を箇条書きで具体的に解説してください。英語の場合は自然な日本語に翻訳して解説してください。
+        【取得した投稿テキスト】
+        {extracted_text}
 
-    【3. 実践アクション・示唆】
-    得られる教訓や具体的なアクションプランを整理してください。
-    """
+        【1. 全体エグゼクティブサマリー】
+        メインテーマと結論を3〜4行で簡潔にまとめてください。
+
+        【2. 重要ポイント詳細解説】
+        主要な論点、背景、手法、事実を箇条書きで具体的に解説してください。
+
+        【3. 実践アクション・示唆】
+        得られる教訓や具体的なアクションプランを整理してください。
+        """
+    else:
+        # YouTube等、その他のURLの場合のプロンプト
+        prompt = f"""
+        以下のコンテンツ（URL: {url}）について、内容を分かりやすく要約・解説してください。英語の場合は自然な日本語に翻訳してください。
+
+        【1. 全体エグゼクティブサマリー】
+        メインテーマと結論を3〜4行で簡潔にまとめてください。
+
+        【2. 重要ポイント詳細解説】
+        主要な論点、背景、手法、事実を箇条書きで具体的に解説してください。
+
+        【3. 実践アクション・示唆】
+        得られる教訓や具体的なアクションプランを整理してください。
+        """
+
     try:
         response = gemini_client.models.generate_content(
             model='gemini-3.6-flash',
