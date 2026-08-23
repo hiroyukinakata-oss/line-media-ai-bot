@@ -1,5 +1,7 @@
-flask
+Flask
 line-bot-sdk
 google-genai
-yt-dlp
+youtube-transcript-api
+beautifulsoup4
 gunicorn
+requests
