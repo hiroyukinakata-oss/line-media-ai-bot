@@ -39,7 +39,7 @@ def async_process_ai(user_id: str, url: str):
     """
     try:
         response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.6-flash',
             contents=prompt,
         )
         summary_text = response.text
