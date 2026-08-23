@@ -27,7 +27,7 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 def async_process_ai(user_id: str, url: str):
     prompt = f"""
-    以下のURLで共有されたコンテンツ（動画、投稿、記事）についてGoogle検索等のツールを駆使して内容を正確に把握・調査し、以下の構成で自然な日本語で分かりやすく要約・解説してください。
+    以下のコンテンツ（URL: {url}）についてGoogle検索等を用いて詳細内容を調べ、以下の構成で自然な日本語で分かりやすく要約・解説してください。
 
     URL: {url}
 
@@ -42,7 +42,7 @@ def async_process_ai(user_id: str, url: str):
     """
     try:
         response = gemini_client.models.generate_content(
-            model='gemini-3.6-flash',
+            model='gemini-2.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())]
