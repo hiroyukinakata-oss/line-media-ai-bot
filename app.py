@@ -13,6 +13,7 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from google import genai
+from google.genai import types
 
 app = Flask(__name__)
 
@@ -26,7 +27,9 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 def async_process_ai(user_id: str, url: str):
     prompt = f"""
-    以下のコンテンツ（URL: {url}）の内容を把握・分析し、以下の構成で自然な日本語で分かりやすく要約・解説してください。
+    以下のURLで共有されたコンテンツ（動画、投稿、記事）についてGoogle検索等のツールを駆使して内容を正確に把握・調査し、以下の構成で自然な日本語で分かりやすく要約・解説してください。
+
+    URL: {url}
 
     【1. 全体エグゼクティブサマリー】
     メインテーマと結論を3〜4行で簡潔にまとめてください。
@@ -41,6 +44,9 @@ def async_process_ai(user_id: str, url: str):
         response = gemini_client.models.generate_content(
             model='gemini-3.6-flash',
             contents=prompt,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())]
+            )
         )
         summary_text = response.text
 
@@ -101,7 +107,7 @@ def handle_message(event):
         MessagingApi(api_client).reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text="🔍 コンテンツを解析中です...\n少々お待ちください（15〜30秒程度）")]
+                messages=[TextMessage(text="🔍 コンテンツを検索・解析中です...\n少々お待ちください（15〜30秒程度）")]
             )
         )
 
