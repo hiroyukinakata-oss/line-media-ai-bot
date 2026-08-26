@@ -1,10 +1,10 @@
 import os
 import threading
 import json
-import urllib.request
 import re
 import uuid
-from urllib.parse import urlparse, parse_qs
+import requests
+from urllib.parse import urlparse
 from flask import Flask, request, abort, render_template_string, Response
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -30,88 +30,100 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 summary_db = {}
 
 def get_expanded_url(url: str) -> str:
-    """t.coなどの短縮URLから本来のURL（YouTube等）を割り出す処理"""
+    """t.coなどの短縮URLから本来のURLを確実に追跡する"""
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        req.get_method = lambda: 'HEAD'
-        with urllib.request.urlopen(req, timeout=5) as res:
+        with requests.get(url, timeout=10, stream=True, headers={'User-Agent': 'Mozilla/5.0'}) as res:
             return res.url
     except Exception:
         return url
 
 def extract_x_data(url: str):
+    """Xの投稿文と、そこに含まれるリンクを取得する"""
     text = ""
     expanded_urls = []
     try:
         parsed = urlparse(url)
         if parsed.netloc in ["twitter.com", "x.com", "www.twitter.com", "www.x.com"]:
             api_url = f"https://api.vxtwitter.com{parsed.path}"
-            req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req) as res:
-                data = json.loads(res.read().decode())
+            with requests.get(api_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10) as res:
+                data = res.json()
                 text = data.get("text", "")
                 
-                # ツイート内の短縮URLを展開してリスト化する
+                # 引用リツイートなどのURLも補完
+                if "qrtURL" in data:
+                    text += f" {data['qrtURL']}"
+                    
                 raw_urls = re.findall(r'(https?://[^\s]+)', text)
                 for r_url in raw_urls:
+                    r_url = r_url.rstrip(').,;!?') # 末尾のゴミを除去
                     e_url = get_expanded_url(r_url)
                     if e_url not in expanded_urls:
                         expanded_urls.append(e_url)
-    except Exception:
-        pass
+    except Exception as e:
+        text = f"（※Xデータ取得エラー: {str(e)}）"
     return text, expanded_urls
 
 def get_youtube_transcript(url: str) -> str:
+    """YouTubeからどんな言語・自動生成でも字幕を強制取得する"""
     try:
-        parsed = urlparse(url)
-        video_id = None
-        if parsed.netloc in ["youtu.be"]:
-            video_id = parsed.path.lstrip('/')
-        elif parsed.netloc in ["www.youtube.com", "youtube.com", "m.youtube.com"]:
-            video_id = parse_qs(parsed.query).get("v", [None])[0]
+        # 様々な形式のYouTubeリンクから動画IDを抽出する強力な正規表現
+        match = re.search(r'(?:youtu\.be/|youtube\.com/(?:watch\?(?:.*&)?v=|embed/|v/|shorts/|live/))([^&?/\s]+)', url)
+        if not match:
+            return "（※YouTubeの動画IDが検出できませんでした）"
         
-        if video_id:
-            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['ja', 'en'])
-            return " ".join([t['text'] for t in transcript])
+        video_id = match.group(1)
+        
+        # 利用可能な字幕リストを取得し、最初に見つかったもの（自動生成含む）を取得
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        transcript = next(iter(transcript_list))
+        fetched = transcript.fetch()
+        
+        return " ".join([t['text'] for t in fetched])
     except Exception as e:
-        return f"（※字幕取得エラー: {str(e)}）"
-    return ""
+        return f"（※字幕データの取得に失敗しました。字幕が存在しない動画の可能性があります: {str(e)}）"
 
 def scrape_webpage(url: str) -> str:
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=5) as res:
-            soup = BeautifulSoup(res.read().decode('utf-8'), 'html.parser')
+        with requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10) as res:
+            res.encoding = res.apparent_encoding
+            soup = BeautifulSoup(res.text, 'html.parser')
             return soup.get_text(separator=' ', strip=True)
-    except Exception:
-        return ""
+    except Exception as e:
+        return f"（※記事の取得に失敗しました: {str(e)}）"
 
 def async_process_ai(user_id: str, original_url: str, host_url: str):
     content_sources = []
+    trace_log = [] # 原因究明用のシステムログ
     
     if "x.com" in original_url or "twitter.com" in original_url:
         x_text, extracted_urls = extract_x_data(original_url)
         if x_text:
             content_sources.append(f"【Xの投稿内容】\n{x_text}")
         
+        trace_log.append(f"🔍 検出された内部URL: {extracted_urls}")
+        
         for url in extracted_urls:
             if 'youtu' in url or 'youtube.com' in url:
+                trace_log.append(f"▶ YouTubeとして処理: {url}")
                 ts = get_youtube_transcript(url)
-                if ts: 
-                    content_sources.append(f"【動画字幕（全文）】\n{ts[:300000]}")
+                content_sources.append(f"【動画字幕（{url}）】\n{ts[:300000]}")
             else:
+                trace_log.append(f"📄 外部記事として処理: {url}")
                 text = scrape_webpage(url)
                 if text: 
-                    content_sources.append(f"【記事内容（全文）】\n{text[:100000]}")
+                    content_sources.append(f"【記事内容（{url}）】\n{text[:100000]}")
     else:
+        trace_log.append(f"🔍 直接入力されたURL: {original_url}")
         if 'youtu' in original_url or 'youtube.com' in original_url:
             ts = get_youtube_transcript(original_url)
-            if ts: content_sources.append(f"【動画字幕（全文）】\n{ts[:300000]}")
+            content_sources.append(f"【動画字幕（{original_url}）】\n{ts[:300000]}")
         else:
             text = scrape_webpage(original_url)
-            if text: content_sources.append(f"【記事内容（全文）】\n{text[:100000]}")
+            if text: content_sources.append(f"【記事内容（{original_url}）】\n{text[:100000]}")
 
-    combined_text = "\n\n".join(content_sources) if content_sources else f"URL: {original_url} (※有効なテキストが抽出できませんでした)"
+    # 生データの冒頭にシステムログを追加（何が起きたか見れるようにする）
+    content_sources.insert(0, f"【システム処理ログ】\n" + "\n".join(trace_log))
+    combined_text = "\n\n".join(content_sources)
 
     prompt = f"""
     以下の抽出データ（Xの投稿、長時間の動画字幕、Web記事など）の内容をベースに、超特大ボリュームで、予備知識のない小学生や初心者でも「なるほど！そういう仕組みなんだ！」と完璧に理解できるレベルの【詳細な深掘り解説レポート】を作成してください。
