@@ -5,7 +5,7 @@ import urllib.request
 import re
 import uuid
 from urllib.parse import urlparse, parse_qs
-from flask import Flask, request, abort, render_template_string
+from flask import Flask, request, abort, render_template_string, Response
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -90,7 +90,6 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
 
     combined_text = "\n\n".join(content_sources) if content_sources else f"URL: {original_url}"
 
-    # プロンプトの調整（日本語についての指示を明記）
     prompt = f"""
     以下の抽出データ（Xの投稿、長時間の動画字幕、Web記事など）の内容をベースに、超特大ボリュームで、予備知識のない小学生や初心者でも「なるほど！そういう仕組みなんだ！」と完璧に理解できるレベルの【詳細な深掘り解説レポート】を作成してください。
 
@@ -119,7 +118,6 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
         response = gemini_client.models.generate_content(model='gemini-3.6-flash', contents=prompt)
         report_id = str(uuid.uuid4())
         
-        # ★要約結果だけでなく、AIに渡す前の「生の抽出データ」も一緒に保存しておく
         summary_db[report_id] = {
             "summary": response.text,
             "raw_text": combined_text
@@ -127,7 +125,7 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
         
         report_url = f"{host_url.rstrip('/')}/report/{report_id}"
         
-        reply_msg = f"✅ 【深掘り解説】の生成が完了しました。\n以下の専用ページ（複数形式のダウンロード対応）から詳細をご確認ください。\n{report_url}"
+        reply_msg = f"✅ 【深掘り解説】の生成が完了しました。\n以下の専用ページからご確認ください。\n{report_url}"
         
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).push_message(PushMessageRequest(
@@ -157,38 +155,46 @@ def view_report(report_id):
         <title>AI 深掘り解説レポート</title>
         <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
         <style>
-            body { font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Hiragino Sans", Meiryo, sans-serif; line-height: 1.8; padding: 20px; max-width: 900px; margin: 0 auto; background: #f4f7f6; color: #333;}
-            .container { background: #fff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); position: relative; margin-bottom: 60px;}
+            body { font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Hiragino Sans", Meiryo, sans-serif; line-height: 1.8; padding: 15px; max-width: 900px; margin: 0 auto; background: #f4f7f6; color: #333;}
+            .container { background: #fff; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); margin-bottom: 20px;}
             
-            .download-menu { position: fixed; bottom: 20px; right: 20px; background: #27ae60; color: white; padding: 12px 20px; border-radius: 30px; box-shadow: 0 4px 10px rgba(0,0,0,0.2); z-index: 1000; display: flex; align-items: center; gap: 10px; font-weight: bold; cursor: pointer;}
-            .download-menu:hover { background: #219653; }
-            .dropdown-content { display: none; position: absolute; bottom: 50px; right: 0; background: white; color: #333; min-width: 250px; box-shadow: 0 8px 16px rgba(0,0,0,0.2); border-radius: 8px; overflow: hidden; z-index: 1001;}
-            .dropdown-content a { color: #333; padding: 12px 16px; text-decoration: none; display: block; font-size: 0.95em; border-bottom: 1px solid #eee;}
-            .dropdown-content a:hover { background: #f1f1f1; color: #27ae60;}
-            .download-menu.active .dropdown-content { display: block; }
-
-            h1 { font-size: 1.6em; border-bottom: 3px solid #3498db; padding-bottom: 10px; margin-top: 40px; color: #2c3e50;}
-            h2 { font-size: 1.3em; border-left: 5px solid #3498db; padding-left: 15px; margin-top: 35px; color: #34495e;}
-            h3 { font-size: 1.1em; color: #7f8c8d; margin-top: 25px;}
-            p { font-size: 1.05em; margin-bottom: 20px; }
-            ul, ol { font-size: 1.05em; margin-bottom: 20px; padding-left: 25px;}
-            li { margin-bottom: 10px; }
-            strong { color: #e74c3c; background: transparent;}
+            /* コントロールパネル */
+            .action-card { background: #e8f5e9; border: 2px solid #a5d6a7; border-radius: 10px; padding: 15px; margin-bottom: 20px; }
+            .action-title { font-weight: bold; font-size: 1.05em; color: #1b5e20; margin-bottom: 10px; }
+            .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+            .btn { display: block; text-align: center; padding: 10px 8px; border-radius: 6px; font-weight: bold; font-size: 0.9em; text-decoration: none; cursor: pointer; border: none; transition: 0.2s; }
+            .btn-primary { background: #2e7d32; color: #fff; }
+            .btn-secondary { background: #37474f; color: #fff; }
+            .btn-outline { background: #fff; color: #2e7d32; border: 1px solid #2e7d32; }
+            .btn:active { opacity: 0.7; }
+            
+            h1 { font-size: 1.4em; border-bottom: 3px solid #3498db; padding-bottom: 8px; margin-top: 30px; color: #2c3e50;}
+            h2 { font-size: 1.2em; border-left: 5px solid #3498db; padding-left: 12px; margin-top: 25px; color: #34495e;}
+            h3 { font-size: 1.05em; color: #7f8c8d; margin-top: 20px;}
+            p { font-size: 1em; margin-bottom: 15px; }
+            ul, ol { font-size: 1em; margin-bottom: 15px; padding-left: 20px;}
+            li { margin-bottom: 8px; }
+            strong { color: #e74c3c; }
             code { background: #f8f9fa; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; color: #e83e8c;}
+            
+            #toast { visibility: hidden; min-width: 200px; background-color: #333; color: #fff; text-align: center; border-radius: 8px; padding: 12px; position: fixed; z-index: 9999; left: 50%; bottom: 30px; transform: translateX(-50%); font-size: 0.9em;}
+            #toast.show { visibility: visible; }
         </style>
     </head>
     <body>
-        <div class="container" id="content"></div>
-
-        <div class="download-menu" id="downloadMenu" onclick="toggleMenu(event)">
-            <span>📥 ダウンロード ▼</span>
-            <div class="dropdown-content">
-                <a href="#" onclick="downloadFile('html')">🌐 要約レポート (.html)</a>
-                <a href="#" onclick="downloadFile('md')">📝 要約レポート (.md)</a>
-                <a href="#" onclick="downloadFile('txt')">📄 要約レポート (.txt)</a>
-                <a href="#" onclick="downloadFile('raw')">📦 抽出した生データ (要約なし全文) (.txt)</a>
+        <div class="action-card">
+            <div class="action-title">⚡ アクションメニュー</div>
+            <div class="btn-grid">
+                <button class="btn btn-primary" onclick="copyText('summary')">📋 要約をコピー</button>
+                <button class="btn btn-secondary" onclick="copyText('raw')">📋 生データをコピー</button>
+                <a class="btn btn-outline" href="/download/{{ report_id }}/txt" target="_blank">📄 要約 (.txt) 保存</a>
+                <a class="btn btn-outline" href="/download/{{ report_id }}/raw" target="_blank">📦 生データ 保存</a>
             </div>
+            <div style="font-size: 0.8em; color: #555; text-align: center;">※「コピー」を押すとメモ帳やNotion等にすぐ貼り付けできます</div>
         </div>
+
+        <div class="container" id="content"></div>
+        <div id="toast">コピーしました！</div>
 
         <textarea id="raw-markdown" style="display:none;">{{ summary }}</textarea>
         <textarea id="raw-data" style="display:none;">{{ raw_text }}</textarea>
@@ -197,47 +203,46 @@ def view_report(report_id):
             const rawData = document.getElementById('raw-data').value;
             document.getElementById('content').innerHTML = marked.parse(rawText);
 
-            function toggleMenu(event) {
-                event.stopPropagation();
-                document.getElementById('downloadMenu').classList.toggle('active');
+            function showToast(msg) {
+                const toast = document.getElementById("toast");
+                toast.innerText = msg;
+                toast.className = "show";
+                setTimeout(() => { toast.className = toast.className.replace("show", ""); }, 2000);
             }
 
-            window.onclick = function() {
-                document.getElementById('downloadMenu').classList.remove('active');
-            }
-
-            function downloadFile(type) {
-                let blob, filename;
-                
-                if (type === 'html') {
-                    const htmlContent = `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><title>AI 深掘り解説レポート</title><style>body{font-family:sans-serif;line-height:1.8;padding:20px;max-width:900px;margin:0 auto;background:#f4f7f6;color:#333}.container{background:#fff;padding:40px;border-radius:12px;box-shadow:0 4px 15px rgba(0,0,0,0.05)}h1{font-size:1.6em;border-bottom:3px solid #3498db;padding-bottom:10px;margin-top:40px;color:#2c3e50}h2{font-size:1.3em;border-left:5px solid #3498db;padding-left:15px;margin-top:35px;color:#34495e}p{font-size:1.05em;margin-bottom:20px}ul,ol{font-size:1.05em;margin-bottom:20px;padding-left:25px}li{margin-bottom:10px}strong{color:#e74c3c}</style></head><body><div class="container">` + document.getElementById('content').innerHTML + `</div></body></html>`;
-                    blob = new Blob([htmlContent], { type: 'text/html' });
-                    filename = 'ai_report.html';
-                } else if (type === 'md') {
-                    blob = new Blob([rawText], { type: 'text/markdown' });
-                    filename = 'ai_report.md';
-                } else if (type === 'txt') {
-                    const plainText = rawText.replace(/[#*`_]/g, '');
-                    blob = new Blob([plainText], { type: 'text/plain' });
-                    filename = 'ai_report.txt';
-                } else if (type === 'raw') {
-                    // AIに渡す前の「抽出された生データ全文」をダウンロード
-                    blob = new Blob([rawData], { type: 'text/plain' });
-                    filename = 'raw_extracted_data.txt';
-                }
-
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = filename;
-                a.click();
-                URL.revokeObjectURL(url);
+            function copyText(type) {
+                const text = (type === 'summary') ? rawText : rawData;
+                navigator.clipboard.writeText(text).then(() => {
+                    showToast(type === 'summary' ? "要約テキストをコピーしました！" : "生データをコピーしました！");
+                }).catch(() => {
+                    showToast("コピーに失敗しました");
+                });
             }
         </script>
     </body>
     </html>
     """
-    return render_template_string(template, summary=data["summary"], raw_text=data["raw_text"])
+    return render_template_string(template, report_id=report_id, summary=data["summary"], raw_text=data["raw_text"])
+
+# サーバー側から直接ファイルを配信するエンドポイント（LINE内ブラウザ制限対策）
+@app.route("/download/<report_id>/<file_type>", methods=["GET"])
+def download_file(report_id, file_type):
+    data = summary_db.get(report_id)
+    if not data:
+        return "Not Found", 404
+
+    if file_type == "txt":
+        content = data["summary"].replace("#", "").replace("*", "")
+        filename = "ai_summary.txt"
+    elif file_type == "raw":
+        content = data["raw_text"]
+        filename = "raw_extracted_data.txt"
+    else:
+        return "Bad Request", 400
+
+    response = Response(content, mimetype="text/plain; charset=utf-8")
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
 
 @app.route("/callback", methods=["POST"])
 def callback():
