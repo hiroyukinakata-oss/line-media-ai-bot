@@ -29,17 +29,37 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 summary_db = {}
 
-def extract_x_text(url: str) -> str:
+def get_expanded_url(url: str) -> str:
+    """t.coなどの短縮URLから本来のURL（YouTube等）を割り出す処理"""
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        req.get_method = lambda: 'HEAD'
+        with urllib.request.urlopen(req, timeout=5) as res:
+            return res.url
+    except Exception:
+        return url
+
+def extract_x_data(url: str):
+    text = ""
+    expanded_urls = []
     try:
         parsed = urlparse(url)
         if parsed.netloc in ["twitter.com", "x.com", "www.twitter.com", "www.x.com"]:
             api_url = f"https://api.vxtwitter.com{parsed.path}"
             req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req) as res:
-                return json.loads(res.read().decode()).get("text", "")
+                data = json.loads(res.read().decode())
+                text = data.get("text", "")
+                
+                # ツイート内の短縮URLを展開してリスト化する
+                raw_urls = re.findall(r'(https?://[^\s]+)', text)
+                for r_url in raw_urls:
+                    e_url = get_expanded_url(r_url)
+                    if e_url not in expanded_urls:
+                        expanded_urls.append(e_url)
     except Exception:
         pass
-    return ""
+    return text, expanded_urls
 
 def get_youtube_transcript(url: str) -> str:
     try:
@@ -47,20 +67,20 @@ def get_youtube_transcript(url: str) -> str:
         video_id = None
         if parsed.netloc in ["youtu.be"]:
             video_id = parsed.path.lstrip('/')
-        elif parsed.netloc in ["www.youtube.com", "youtube.com"]:
+        elif parsed.netloc in ["www.youtube.com", "youtube.com", "m.youtube.com"]:
             video_id = parse_qs(parsed.query).get("v", [None])[0]
         
         if video_id:
             transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['ja', 'en'])
             return " ".join([t['text'] for t in transcript])
-    except Exception:
-        pass
+    except Exception as e:
+        return f"（※字幕取得エラー: {str(e)}）"
     return ""
 
 def scrape_webpage(url: str) -> str:
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as res:
+        with urllib.request.urlopen(req, timeout=5) as res:
             soup = BeautifulSoup(res.read().decode('utf-8'), 'html.parser')
             return soup.get_text(separator=' ', strip=True)
     except Exception:
@@ -68,18 +88,21 @@ def scrape_webpage(url: str) -> str:
 
 def async_process_ai(user_id: str, original_url: str, host_url: str):
     content_sources = []
-    x_text = extract_x_text(original_url)
-
-    if x_text:
-        content_sources.append(f"【Xの投稿内容】\n{x_text}")
-        urls = re.findall(r'(https?://[^\s]+)', x_text)
-        for url in urls:
+    
+    if "x.com" in original_url or "twitter.com" in original_url:
+        x_text, extracted_urls = extract_x_data(original_url)
+        if x_text:
+            content_sources.append(f"【Xの投稿内容】\n{x_text}")
+        
+        for url in extracted_urls:
             if 'youtu' in url or 'youtube.com' in url:
                 ts = get_youtube_transcript(url)
-                if ts: content_sources.append(f"【動画字幕（全文）】\n{ts[:300000]}")
+                if ts: 
+                    content_sources.append(f"【動画字幕（全文）】\n{ts[:300000]}")
             else:
                 text = scrape_webpage(url)
-                if text: content_sources.append(f"【記事内容（全文）】\n{text[:100000]}")
+                if text: 
+                    content_sources.append(f"【記事内容（全文）】\n{text[:100000]}")
     else:
         if 'youtu' in original_url or 'youtube.com' in original_url:
             ts = get_youtube_transcript(original_url)
@@ -88,7 +111,7 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
             text = scrape_webpage(original_url)
             if text: content_sources.append(f"【記事内容（全文）】\n{text[:100000]}")
 
-    combined_text = "\n\n".join(content_sources) if content_sources else f"URL: {original_url}"
+    combined_text = "\n\n".join(content_sources) if content_sources else f"URL: {original_url} (※有効なテキストが抽出できませんでした)"
 
     prompt = f"""
     以下の抽出データ（Xの投稿、長時間の動画字幕、Web記事など）の内容をベースに、超特大ボリュームで、予備知識のない小学生や初心者でも「なるほど！そういう仕組みなんだ！」と完璧に理解できるレベルの【詳細な深掘り解説レポート】を作成してください。
@@ -158,7 +181,6 @@ def view_report(report_id):
             body { font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Hiragino Sans", Meiryo, sans-serif; line-height: 1.8; padding: 15px; max-width: 900px; margin: 0 auto; background: #f4f7f6; color: #333;}
             .container { background: #fff; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); margin-bottom: 20px;}
             
-            /* コントロールパネル */
             .action-card { background: #e8f5e9; border: 2px solid #a5d6a7; border-radius: 10px; padding: 15px; margin-bottom: 20px; }
             .action-title { font-weight: bold; font-size: 1.05em; color: #1b5e20; margin-bottom: 10px; }
             .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
@@ -190,7 +212,7 @@ def view_report(report_id):
                 <a class="btn btn-outline" href="/download/{{ report_id }}/txt" target="_blank">📄 要約 (.txt) 保存</a>
                 <a class="btn btn-outline" href="/download/{{ report_id }}/raw" target="_blank">📦 生データ 保存</a>
             </div>
-            <div style="font-size: 0.8em; color: #555; text-align: center;">※「コピー」を押すとメモ帳やNotion等にすぐ貼り付けできます</div>
+            <div style="font-size: 0.8em; color: #555; text-align: center;">※「コピー」を押すとメモ帳等にすぐ貼り付けできます</div>
         </div>
 
         <div class="container" id="content"></div>
@@ -224,7 +246,6 @@ def view_report(report_id):
     """
     return render_template_string(template, report_id=report_id, summary=data["summary"], raw_text=data["raw_text"])
 
-# サーバー側から直接ファイルを配信するエンドポイント（LINE内ブラウザ制限対策）
 @app.route("/download/<report_id>/<file_type>", methods=["GET"])
 def download_file(report_id, file_type):
     data = summary_db.get(report_id)
