@@ -74,9 +74,13 @@ def get_youtube_transcript(url: str) -> str:
             return "（※YouTubeの動画IDが検出できませんでした）"
         
         video_id = match.group(1)
-        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['ja', 'en', 'en-US', 'en-GB'])
+        # ライブラリの最新仕様に合わせた記述に変更
+        yt_api = YouTubeTranscriptApi()
+        transcript_list = yt_api.list(video_id)
+        transcript = transcript_list.find_transcript(['ja', 'en', 'en-US', 'en-GB'])
+        fetched = transcript.fetch()
         
-        return " ".join([t['text'] for t in transcript])
+        return " ".join([t['text'] for t in fetched])
     except Exception as e:
         return f"（※字幕データの取得に失敗しました: {str(e)}）"
 
