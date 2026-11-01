@@ -30,7 +30,6 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 summary_db = {}
 
 def get_expanded_url(url: str) -> str:
-    """t.coなどの短縮URLから本来のURLを確実に追跡する"""
     try:
         with requests.get(url, timeout=10, stream=True, headers={'User-Agent': 'Mozilla/5.0'}) as res:
             return res.url
@@ -38,49 +37,50 @@ def get_expanded_url(url: str) -> str:
         return url
 
 def extract_x_data(url: str):
-    """Xの投稿文と、そこに含まれるリンクを取得する"""
     text = ""
     expanded_urls = []
     try:
         parsed = urlparse(url)
         if parsed.netloc in ["twitter.com", "x.com", "www.twitter.com", "www.x.com"]:
-            api_url = f"https://api.vxtwitter.com{parsed.path}"
+            clean_path = parsed.path
+            api_url = f"https://api.vxtwitter.com{clean_path}"
             with requests.get(api_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10) as res:
-                data = res.json()
-                text = data.get("text", "")
-                
-                # 引用リツイートなどのURLも補完
-                if "qrtURL" in data:
-                    text += f" {data['qrtURL']}"
-                    
-                raw_urls = re.findall(r'(https?://[^\s]+)', text)
-                for r_url in raw_urls:
-                    r_url = r_url.rstrip(').,;!?') # 末尾のゴミを除去
-                    e_url = get_expanded_url(r_url)
-                    if e_url not in expanded_urls:
-                        expanded_urls.append(e_url)
+                if res.status_code == 200:
+                    try:
+                        data = res.json()
+                        text = data.get("text", "")
+                        
+                        if "qrtURL" in data:
+                            text += f" {data['qrtURL']}"
+                            
+                        raw_urls = re.findall(r'(https?://[^\s]+)', text)
+                        for r_url in raw_urls:
+                            r_url = r_url.rstrip(').,;!?')
+                            e_url = get_expanded_url(r_url)
+                            if e_url not in expanded_urls:
+                                expanded_urls.append(e_url)
+                    except ValueError:
+                        text = "（※Xからのデータが不正な形式でした。API制限の可能性があります）"
+                else:
+                    text = f"（※Xのデータ取得に失敗しました。ステータスコード: {res.status_code} - ポストが存在しないか制限されています）"
     except Exception as e:
-        text = f"（※Xデータ取得エラー: {str(e)}）"
+        text = f"（※X通信エラー: {str(e)}）"
     return text, expanded_urls
 
 def get_youtube_transcript(url: str) -> str:
-    """YouTubeからどんな言語・自動生成でも字幕を強制取得する"""
     try:
-        # 様々な形式のYouTubeリンクから動画IDを抽出する強力な正規表現
         match = re.search(r'(?:youtu\.be/|youtube\.com/(?:watch\?(?:.*&)?v=|embed/|v/|shorts/|live/))([^&?/\s]+)', url)
         if not match:
             return "（※YouTubeの動画IDが検出できませんでした）"
         
         video_id = match.group(1)
-        
-        # 利用可能な字幕リストを取得し、最初に見つかったもの（自動生成含む）を取得
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         transcript = next(iter(transcript_list))
         fetched = transcript.fetch()
         
         return " ".join([t['text'] for t in fetched])
     except Exception as e:
-        return f"（※字幕データの取得に失敗しました。字幕が存在しない動画の可能性があります: {str(e)}）"
+        return f"（※字幕データの取得に失敗しました: {str(e)}）"
 
 def scrape_webpage(url: str) -> str:
     try:
@@ -93,12 +93,14 @@ def scrape_webpage(url: str) -> str:
 
 def async_process_ai(user_id: str, original_url: str, host_url: str):
     content_sources = []
-    trace_log = [] # 原因究明用のシステムログ
+    trace_log = [] 
     
     if "x.com" in original_url or "twitter.com" in original_url:
         x_text, extracted_urls = extract_x_data(original_url)
-        if x_text:
+        if x_text and not x_text.startswith("（※"):
             content_sources.append(f"【Xの投稿内容】\n{x_text}")
+        else:
+            trace_log.append(f"⚠️ Xデータエラー: {x_text}")
         
         trace_log.append(f"🔍 検出された内部URL: {extracted_urls}")
         
@@ -106,47 +108,49 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
             if 'youtu' in url or 'youtube.com' in url:
                 trace_log.append(f"▶ YouTubeとして処理: {url}")
                 ts = get_youtube_transcript(url)
-                content_sources.append(f"【動画字幕（{url}）】\n{ts[:300000]}")
+                if not ts.startswith("（※"):
+                    content_sources.append(f"【動画字幕（{url}）】\n{ts[:300000]}")
+                else:
+                    trace_log.append(f"⚠️ 字幕エラー: {ts}")
             else:
                 trace_log.append(f"📄 外部記事として処理: {url}")
                 text = scrape_webpage(url)
-                if text: 
+                if text and not text.startswith("（※"): 
                     content_sources.append(f"【記事内容（{url}）】\n{text[:100000]}")
+                else:
+                    trace_log.append(f"⚠️ 記事エラー: {text}")
     else:
         trace_log.append(f"🔍 直接入力されたURL: {original_url}")
         if 'youtu' in original_url or 'youtube.com' in original_url:
             ts = get_youtube_transcript(original_url)
-            content_sources.append(f"【動画字幕（{original_url}）】\n{ts[:300000]}")
+            if not ts.startswith("（※"):
+                content_sources.append(f"【動画字幕（{original_url}）】\n{ts[:300000]}")
+            else:
+                trace_log.append(f"⚠️ 字幕エラー: {ts}")
         else:
             text = scrape_webpage(original_url)
-            if text: content_sources.append(f"【記事内容（{original_url}）】\n{text[:100000]}")
+            if text and not text.startswith("（※"): 
+                content_sources.append(f"【記事内容（{original_url}）】\n{text[:100000]}")
+            else:
+                trace_log.append(f"⚠️ 記事エラー: {text}")
 
-    # 生データの冒頭にシステムログを追加（何が起きたか見れるようにする）
     content_sources.insert(0, f"【システム処理ログ】\n" + "\n".join(trace_log))
     combined_text = "\n\n".join(content_sources)
 
     prompt = f"""
-    以下の抽出データ（Xの投稿、長時間の動画字幕、Web記事など）の内容をベースに、超特大ボリュームで、予備知識のない小学生や初心者でも「なるほど！そういう仕組みなんだ！」と完璧に理解できるレベルの【詳細な深掘り解説レポート】を作成してください。
+    以下の抽出データ（システムログ、Xの投稿、動画字幕、Web記事など）の内容をベースに、超特大ボリュームで、予備知識のない小学生や初心者でも「なるほど！そういう仕組みなんだ！」と完璧に理解できるレベルの【詳細な深掘り解説レポート】を作成してください。
 
-    ※元のデータが英語の場合は自然な日本語に和訳し、日本語の場合はそのまま日本語でわかりやすく解説してください。
-    出力文字数や時間に制限はありません。出し惜しみせず、単なる「目次の紹介」ではなく、「動画や記事の中で具体的に語られていた中身の授業」を、具体例や例え話を交えて徹底的に解説してください。
+    ※もし抽出データがシステムエラーのログのみで、肝心の内容が取得できていない場合は、「データの取得に失敗したため解説できません」という旨を優しく回答してください。
+    出力文字数や時間に制限はありません。出し惜しみせず徹底的に解説してください。
 
     【抽出データ】
     {combined_text}
 
     以下の構成でMarkdown形式で出力してください。
-
     # 1. 【超図解】この記事・動画が伝えたかった最大のテーマ
-    （なぜこの技術や話題が今すごいのか、何が画期的なのかを、わかりやすい例え話を使って解説してください。）
-
     # 2. 【深掘り解説】具体的に何が語られていたか？（重要ポイントの徹底解剖）
-    （動画や記事の中で解説されている具体的な技術、仕組み、アーキテクチャ、学習プロセスなどを、一つ一つ丁寧に、初心者向けに噛み砕いて長文で解説してください。用語の解説も必ず入れてください。）
-
     # 3. 最新のAI・エージェント動向と、私たちへの影響
-    （このコンテンツから読み取れる、最新のAIトレンドや、今後のAI社会がどうなっていくのかという洞察を深く記載してください。）
-
     # 4. 今後のアクション・まとめ
-    （この情報を踏まえて、読者は何を学ぶべきかを提示してください。）
     """
     
     try:
@@ -160,7 +164,7 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
         
         report_url = f"{host_url.rstrip('/')}/report/{report_id}"
         
-        reply_msg = f"✅ 【深掘り解説】の生成が完了しました。\n以下の専用ページからご確認ください。\n{report_url}"
+        reply_msg = f"✅ 処理が完了しました。\n以下の専用ページからご確認ください。\n{report_url}"
         
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).push_message(PushMessageRequest(
