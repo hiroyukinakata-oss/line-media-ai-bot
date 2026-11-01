@@ -74,11 +74,9 @@ def get_youtube_transcript(url: str) -> str:
             return "（※YouTubeの動画IDが検出できませんでした）"
         
         video_id = match.group(1)
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        transcript = next(iter(transcript_list))
-        fetched = transcript.fetch()
+        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['ja', 'en', 'en-US', 'en-GB'])
         
-        return " ".join([t['text'] for t in fetched])
+        return " ".join([t['text'] for t in transcript])
     except Exception as e:
         return f"（※字幕データの取得に失敗しました: {str(e)}）"
 
