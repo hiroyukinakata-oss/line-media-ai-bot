@@ -75,12 +75,10 @@ def scrape_webpage(url: str) -> str:
             res.encoding = res.apparent_encoding
             soup = BeautifulSoup(res.text, 'html.parser')
             return soup.get_text(separator=' ', strip=True)
-    except Exception e:
+    except Exception as e:
         return f"（※記事の取得に失敗しました: {str(e)}）"
 
 def get_youtube_transcript(url: str) -> str:
-    # 解決策: AIエージェント専用の抽出API (Jina Reader) に完全移行
-    # ローカルのスクレイピングライブラリを捨て、YouTubeの強固なBot判定をAPI側で回避します
     try:
         jina_url = f"https://r.jina.ai/{url}"
         headers = {
