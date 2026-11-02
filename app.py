@@ -4,7 +4,6 @@ import json
 import re
 import uuid
 import requests
-import urllib.parse
 from urllib.parse import urlparse
 from flask import Flask, request, abort, render_template_string, Response
 from linebot.v3 import WebhookHandler
@@ -16,14 +15,12 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from google import genai
 from bs4 import BeautifulSoup
-import yt_dlp
 
 app = Flask(__name__)
 
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -66,82 +63,41 @@ def extract_x_data(url: str):
 
 def scrape_webpage(url: str) -> str:
     try:
-        if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
-            encoded_url = urllib.parse.quote(url, safe='')
-            api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={encoded_url}"
-            with requests.get(api_url, timeout=20) as res:
-                res.encoding = res.apparent_encoding
-                soup = BeautifulSoup(res.text, 'html.parser')
-                return soup.get_text(separator=' ', strip=True)
-        else:
-            with requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10) as res:
-                res.encoding = res.apparent_encoding
-                soup = BeautifulSoup(res.text, 'html.parser')
-                return soup.get_text(separator=' ', strip=True)
-    except Exception as e:
+        jina_url = f"https://r.jina.ai/{url}"
+        res = requests.get(jina_url, headers={"Accept": "text/plain"}, timeout=20)
+        if res.status_code == 200 and len(res.text) > 50:
+            return res.text
+    except Exception:
+        pass
+        
+    try:
+        with requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10) as res:
+            res.encoding = res.apparent_encoding
+            soup = BeautifulSoup(res.text, 'html.parser')
+            return soup.get_text(separator=' ', strip=True)
+    except Exception e:
         return f"（※記事の取得に失敗しました: {str(e)}）"
 
 def get_youtube_transcript(url: str) -> str:
-    ydl_opts = {
-        'skip_download': True,
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': False,
-        'nocheckcertificate': True, # プロキシ経由時のSSLエラーを回避
-    }
-    
-    # yt-dlpのアクセスをScraperAPI経由に偽装し、YouTubeのBotブロック（ログイン要求）を回避
-    if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
-        ydl_opts['proxy'] = f"http://scraperapi:{SCRAPER_API_KEY}@proxy-server.scraperapi.com:8001"
-
+    # 解決策: AIエージェント専用の抽出API (Jina Reader) に完全移行
+    # ローカルのスクレイピングライブラリを捨て、YouTubeの強固なBot判定をAPI側で回避します
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-        subs = info.get('subtitles', {})
-        auto_subs = info.get('automatic_captions', {})
+        jina_url = f"https://r.jina.ai/{url}"
+        headers = {
+            "Accept": "text/plain",
+            "X-Return-Format": "markdown",
+            "X-No-Cache": "true"
+        }
+        res = requests.get(jina_url, headers=headers, timeout=45)
         
-        target_url = None
-        for lang in ['en', 'en-US', 'en-GB', 'ja']:
-            if lang in subs:
-                for fmt in subs[lang]:
-                    if fmt.get('ext') == 'json3':
-                        target_url = fmt.get('url')
-                        break
-                if target_url: break
-        
-        if not target_url:
-            for lang in ['en', 'en-US', 'en-GB', 'ja']:
-                if lang in auto_subs:
-                    for fmt in auto_subs[lang]:
-                        if fmt.get('ext') == 'json3':
-                            target_url = fmt.get('url')
-                            break
-                    if target_url: break
-                    
-        if not target_url:
-            return "（※字幕データが存在しないか、取得可能な形式が見つかりませんでした）"
-            
-        # 抽出した字幕データへの直接アクセスもScraperAPIを経由してIPブロックを防ぐ
-        if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
-            encoded_target_url = urllib.parse.quote(target_url, safe='')
-            api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={encoded_target_url}"
-        else:
-            api_url = target_url
-            
-        res = requests.get(api_url, timeout=30)
-        data = res.json()
-        transcript_text = ""
-        for ev in data.get('events', []):
-            for s in ev.get('segs', []):
-                transcript_text += s.get('utf8', '')
+        if res.status_code == 200:
+            text = res.text
+            if len(text) > 100:
+                return text.strip()
                 
-        if not transcript_text.strip():
-            return "（※字幕の内容が空でした）"
-            
-        return transcript_text.strip()
+        return f"（※抽出APIエラー: ステータス {res.status_code}）"
     except Exception as e:
-        return f"（※yt-dlp抽出エラー: {str(e)}）"
+        return f"（※通信エラー: {str(e)}）"
 
 def async_process_ai(user_id: str, original_url: str, host_url: str):
     content_sources = []
@@ -158,12 +114,12 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
         
         for url in extracted_urls:
             if 'youtu' in url or 'youtube.com' in url:
-                trace_log.append(f"▶ YouTube字幕抽出: {url}")
+                trace_log.append(f"▶ YouTubeデータ抽出: {url}")
                 ts = get_youtube_transcript(url)
                 if ts.startswith("（※"):
                     critical_error_msg = ts
                 else:
-                    content_sources.append(f"【動画字幕({url})】\n{ts[:300000]}")
+                    content_sources.append(f"【動画データ({url})】\n{ts[:300000]}")
                     has_valid_content = True
             else:
                 trace_log.append(f"📄 外部記事抽出: {url}")
@@ -178,7 +134,7 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
             if ts.startswith("（※"):
                 critical_error_msg = ts
             else:
-                content_sources.append(f"【動画字幕({original_url})】\n{ts[:300000]}")
+                content_sources.append(f"【動画データ({original_url})】\n{ts[:300000]}")
                 has_valid_content = True
         else:
             text = scrape_webpage(original_url)
@@ -187,13 +143,13 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
                 has_valid_content = True
 
     if critical_error_msg:
-        reply_msg = f"⚠️ エラー：動画の字幕取得に失敗しました。\n詳細: {critical_error_msg}\n\n※事実に基づかない推測レポートの作成を防ぐため、処理を中断しました。"
+        reply_msg = f"⚠️ エラー：動画データの取得に失敗しました。\n詳細: {critical_error_msg}\n\n※事実に基づかない推測レポートの作成を防ぐため、処理を中断しました。"
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=reply_msg)]))
         return
         
     if not has_valid_content:
-        reply_msg = "⚠️ エラー：有効なテキストデータ（投稿、字幕、記事）を一切取得できませんでした。処理を中断します。"
+        reply_msg = "⚠️ エラー：有効なテキストデータを取得できませんでした。処理を中断します。"
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=reply_msg)]))
         return
@@ -203,7 +159,7 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
 
     prompt = f"""
     あなたは海外の最新AIトレンドを解析し、事業実装をサポートする専門エージェントです。
-    以下の抽出データ（Xの英語投稿、海外YouTube動画の字幕、Web記事など）を読み解き、英語の一次情報を完全に日本語化・体系化した【深掘り解説レポート】を作成してください。
+    以下の抽出データ（Xの英語投稿、海外YouTube動画の内容、Web記事など）を読み解き、英語の一次情報を完全に日本語化・体系化した【深掘り解説レポート】を作成してください。
 
     特に、この情報を「越境ECや無在庫販売システム（eBay/Shopee等）の半自動化、およびAIエージェントを活用した事業効率化」にどのように応用できるかという視点を必ず盛り込んでください。
 
