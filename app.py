@@ -14,7 +14,6 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from google import genai
-from youtube_transcript_api import YouTubeTranscriptApi
 from bs4 import BeautifulSoup
 
 app = Flask(__name__)
@@ -61,35 +60,75 @@ def extract_x_data(url: str):
                             if e_url not in expanded_urls:
                                 expanded_urls.append(e_url)
                     except ValueError:
-                        text = "（※Xからのデータが不正な形式でした。API制限の可能性があります）"
+                        text = "（※Xからのデータが不正な形式でした）"
                 else:
-                    text = f"（※Xのデータ取得に失敗しました。ステータスコード: {res.status_code} - ポストが存在しないか制限されています）"
+                    text = f"（※Xデータ取得失敗: {res.status_code}）"
     except Exception as e:
         text = f"（※X通信エラー: {str(e)}）"
     return text, expanded_urls
 
 def get_youtube_transcript(url: str) -> str:
+    # 完全に独自開発したIPブロック回避・安定版取得ロジック
     try:
         match = re.search(r'(?:youtu\.be/|youtube\.com/(?:watch\?(?:.*&)?v=|embed/|v/|shorts/|live/))([^&?/\s]+)', url)
         if not match:
             return "（※YouTubeの動画IDが検出できませんでした）"
         
         video_id = match.group(1)
+        target_url = f"https://www.youtube.com/watch?v={video_id}"
         
-        # プロキシ（ScraperAPI）がYouTubeの内部XML通信を破壊し「no element found」エラーを引き起こすため、
-        # 字幕取得はプロキシを経由せず直接取得するよう分離・修正
-        transcript = YouTubeTranscriptApi.get_transcript(
-            video_id, 
-            languages=['ja', 'en', 'en-US', 'en-GB']
-        )
+        # 1. ScraperAPIの強力なREST API経由でYouTube本体のHTMLを取得
+        if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
+            api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={target_url}"
+        else:
+            api_url = target_url
+            
+        res = requests.get(api_url, timeout=20)
         
-        return " ".join([t['text'] for t in transcript])
+        # 2. HTMLの奥深くから、字幕データ専用の直リンク（baseUrl）を正規表現で抽出
+        urls = re.findall(r'"baseUrl":"(https://www\.youtube\.com/api/timedtext[^"]+)"', res.text)
+        if not urls:
+            return "（※この動画には字幕データが存在しないか、設定でオフになっています）"
+            
+        # URLのエンコード文字を修正
+        decoded_urls = [u.replace('\\u0026', '&') for u in urls]
+        
+        # 日本語字幕を最優先で探索
+        track_url = decoded_urls[0]
+        for u in decoded_urls:
+            if 'lang=ja' in u:
+                track_url = u
+                break
+                
+        # 3. 字幕データ本体もScraperAPI経由で安全に取得
+        if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
+            track_api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={track_url}"
+        else:
+            track_api_url = track_url
+            
+        res_track = requests.get(track_api_url, timeout=20)
+        
+        # 4. JSON形式・XML形式の両方に対応した字幕テキストの抽出
+        transcript_text = ""
+        try:
+            data = res_track.json()
+            events = data.get('events', [])
+            for ev in events:
+                for s in ev.get('segs', []):
+                    transcript_text += s.get('utf8', '') + " "
+        except Exception:
+            soup = BeautifulSoup(res_track.text, 'html.parser')
+            transcript_text = " ".join([t.text for t in soup.find_all('text')])
+            
+        if not transcript_text.strip():
+            return "（※字幕の内容が空でした）"
+            
+        return transcript_text.strip()
     except Exception as e:
         return f"（※字幕データの取得に失敗しました: {str(e)}）"
 
 def scrape_webpage(url: str) -> str:
     try:
-        # 一般のWeb記事取得にはIPブロック回避能力が高いScraperAPIを適用
         if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
             api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={url}"
             with requests.get(api_url, timeout=20) as res:
