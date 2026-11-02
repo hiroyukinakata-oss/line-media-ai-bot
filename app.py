@@ -4,6 +4,7 @@ import json
 import re
 import uuid
 import requests
+import urllib3
 from urllib.parse import urlparse
 from flask import Flask, request, abort, render_template_string, Response
 from linebot.v3 import WebhookHandler
@@ -16,6 +17,15 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from google import genai
 from youtube_transcript_api import YouTubeTranscriptApi
 from bs4 import BeautifulSoup
+
+# --- SSL証明書エラーを回避するためのパッチ処理 ---
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+_orig_request = requests.Session.request
+def _patched_request(*args, **kwargs):
+    kwargs['verify'] = False
+    return _orig_request(*args, **kwargs)
+requests.Session.request = _patched_request
+# ------------------------------------------------
 
 app = Flask(__name__)
 
@@ -75,7 +85,7 @@ def get_youtube_transcript(url: str) -> str:
         
         video_id = match.group(1)
         
-        # ScraperAPIによるプロキシ（中継）設定（Renderの環境変数から安全に読み込みます）
+        # ScraperAPIによるプロキシ（中継）設定
         scraper_api_key = os.environ.get("SCRAPER_API_KEY")
         proxies = None
         if scraper_api_key and scraper_api_key.strip() != "":
