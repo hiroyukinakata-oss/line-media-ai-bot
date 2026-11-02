@@ -25,6 +25,7 @@ SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
+# Gemini APIクライアントの初期化
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 summary_db = {}
@@ -64,58 +65,6 @@ def extract_x_data(url: str):
         text = f"（※X通信エラー: {str(e)}）"
     return text, expanded_urls
 
-def get_youtube_transcript(url: str) -> str:
-    try:
-        match = re.search(r'(?:youtu\.be/|youtube\.com/(?:watch\?(?:.*&)?v=|embed/|v/|shorts/|live/))([^&?/\s]+)', url)
-        if not match: return "（※YouTubeの動画IDが検出できませんでした）"
-        
-        video_id = match.group(1)
-        target_url = f"https://www.youtube.com/watch?v={video_id}"
-        
-        if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
-            api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={target_url}"
-        else:
-            api_url = target_url
-            
-        res = requests.get(api_url, timeout=30)
-        
-        # 【修正箇所】エスケープ文字を含むURLも漏らさず抽出する検索ルールに変更
-        urls = re.findall(r'"baseUrl":"([^"]+timedtext[^"]+)"', res.text)
-        if not urls:
-            return "（※字幕データへのリンクが見つかりませんでした。動画に字幕がないか、プロキシがブロックされました）"
-            
-        decoded_urls = [u.replace('\\u0026', '&').replace('\\/', '/').replace('\\\\', '\\') for u in urls]
-        
-        track_url = decoded_urls[0]
-        for u in decoded_urls:
-            if 'lang=ja' in u:
-                track_url = u
-                break
-                
-        if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
-            track_api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={track_url}"
-        else:
-            track_api_url = track_url
-            
-        res_track = requests.get(track_api_url, timeout=30)
-        
-        transcript_text = ""
-        try:
-            data = res_track.json()
-            for ev in data.get('events', []):
-                for s in ev.get('segs', []):
-                    transcript_text += s.get('utf8', '')
-        except:
-            soup = BeautifulSoup(res_track.text, 'html.parser')
-            transcript_text = "".join([t.text for t in soup.find_all('text')])
-            
-        if not transcript_text.strip():
-            return "（※字幕データを取得しましたが、テキストが空でした）"
-            
-        return transcript_text.strip()
-    except Exception as e:
-        return f"（※字幕データの取得に失敗しました: {str(e)}）"
-
 def scrape_webpage(url: str) -> str:
     try:
         if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
@@ -134,8 +83,9 @@ def scrape_webpage(url: str) -> str:
 
 def async_process_ai(user_id: str, original_url: str, host_url: str):
     content_sources = []
-    trace_log = [] 
-    
+    trace_log = []
+    youtube_video_uri = None
+
     if "x.com" in original_url or "twitter.com" in original_url:
         x_text, extracted_urls = extract_x_data(original_url)
         if x_text and not x_text.startswith("（※"):
@@ -143,33 +93,26 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
         else:
             trace_log.append(f"⚠️ Xデータエラー: {x_text}")
         trace_log.append(f"🔍 検出された内部URL: {extracted_urls}")
-        
+
         for url in extracted_urls:
             if 'youtu' in url or 'youtube.com' in url:
-                trace_log.append(f"▶ YouTubeとして処理: {url}")
-                ts = get_youtube_transcript(url)
-                if not ts.startswith("（※"):
-                    content_sources.append(f"【動画字幕（{url}）】\n{ts[:300000]}")
-                else:
-                    trace_log.append(f"⚠️ 字幕エラー: {ts}")
+                trace_log.append(f"▶ YouTube動画を検出: {url}")
+                youtube_video_uri = url
             else:
                 trace_log.append(f"📄 外部記事として処理: {url}")
                 text = scrape_webpage(url)
-                if text and not text.startswith("（※"): 
+                if text and not text.startswith("（※"):
                     content_sources.append(f"【記事内容（{url}）】\n{text[:100000]}")
                 else:
                     trace_log.append(f"⚠️ 記事エラー: {text}")
     else:
         trace_log.append(f"🔍 直接入力されたURL: {original_url}")
         if 'youtu' in original_url or 'youtube.com' in original_url:
-            ts = get_youtube_transcript(original_url)
-            if not ts.startswith("（※"):
-                content_sources.append(f"【動画字幕（{original_url}）】\n{ts[:300000]}")
-            else:
-                trace_log.append(f"⚠️ 字幕エラー: {ts}")
+            trace_log.append(f"▶ YouTube動画を検出: {original_url}")
+            youtube_video_uri = original_url
         else:
             text = scrape_webpage(original_url)
-            if text and not text.startswith("（※"): 
+            if text and not text.startswith("（※"):
                 content_sources.append(f"【記事内容（{original_url}）】\n{text[:100000]}")
             else:
                 trace_log.append(f"⚠️ 記事エラー: {text}")
@@ -177,8 +120,9 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
     content_sources.insert(0, f"【システム処理ログ】\n" + "\n".join(trace_log))
     combined_text = "\n\n".join(content_sources)
 
+    # Geminiへのプロンプト設定
     prompt = f"""
-    以下の抽出データ（システムログ、Xの投稿、動画字幕、Web記事など）の内容をベースに、超特大ボリュームで、予備知識のない小学生や初心者でも「なるほど！そういう仕組みなんだ！」と完璧に理解できるレベルの【詳細な深掘り解説レポート】を作成してください。
+    以下の抽出データ（システムログ、Xの投稿、動画解析結果、Web記事など）の内容をベースに、超特大ボリュームで、予備知識のない小学生や初心者でも「なるほど！そういう仕組みなんだ！」と完璧に理解できるレベルの【詳細な深掘り解説レポート】を作成してください。
 
     ※もし抽出データがシステムエラーのログのみで、肝心の内容が取得できていない場合は、「データの取得に失敗したため解説できません」という旨を優しく回答してください。
     出力文字数や時間に制限はありません。出し惜しみせず徹底的に解説してください。
@@ -192,13 +136,44 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
     # 3. 最新のAI・エージェント動向と、私たちへの影響
     # 4. 今後のアクション・まとめ
     """
-    
+
     try:
-        response = gemini_client.models.generate_content(model='gemini-3.6-flash', contents=prompt)
+        # YouTube動画が検出された場合、GeminiのInteractions APIを使用してURLから直接解析を行う
+        if youtube_video_uri:
+            # モデル名は実際に利用可能なものを指定 (例: gemini-3.6-flash, gemini-3.8-flash)
+            # GEMINI_MODEL環境変数が設定されていればそれを使用、なければデフォルトを使用
+            gemini_model = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash") 
+
+            interaction = gemini_client.interactions.create(
+                model=gemini_model,
+                input=[
+                    {
+                        "type": "video",
+                        "uri": youtube_video_uri
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt
+                    }
+                ]
+            )
+            response_text = interaction.output_text
+            if not response_text or not response_text.strip():
+                 raise RuntimeError("Geminiから有効なレポートが返りませんでした")
+            report = response_text.strip()
+            raw_data = f"YouTube解析結果: {youtube_video_uri}\n{combined_text}"
+            
+        else:
+            # 動画がない場合はテキスト入力のみで通常の生成処理
+            response = gemini_client.models.generate_content(model='gemini-3.6-flash', contents=prompt)
+            report = response.text
+            raw_data = combined_text
+
         report_id = str(uuid.uuid4())
-        summary_db[report_id] = {"summary": response.text, "raw_text": combined_text}
+        summary_db[report_id] = {"summary": report, "raw_text": raw_data}
         report_url = f"{host_url.rstrip('/')}/report/{report_id}"
         reply_msg = f"✅ 処理が完了しました。\n以下の専用ページからご確認ください。\n{report_url}"
+
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=reply_msg)]))
     except Exception as e:
