@@ -16,6 +16,7 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from google import genai
 from bs4 import BeautifulSoup
+import yt_dlp
 
 app = Flask(__name__)
 
@@ -81,37 +82,53 @@ def scrape_webpage(url: str) -> str:
         return f"（※記事の取得に失敗しました: {str(e)}）"
 
 def get_youtube_transcript(url: str) -> str:
+    ydl_opts = {
+        'skip_download': True,
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+    }
     try:
-        match = re.search(r'(?:youtu\.be/|youtube\.com/(?:watch\?(?:.*&)?v=|embed/|v/|shorts/|live/))([^&?/\s]+)', url)
-        if not match: return "（※動画ID検出不可）"
-        video_id = match.group(1)
-        
-        # 【新方式】サードパーティの字幕専用APIを使い、YouTube本体の強力なIPブロックを完全に回避
-        try:
-            res = requests.get(f"https://youtubetranscript.com/?server_vid2={video_id}", timeout=15)
-            if res.status_code == 200 and '<transcript' in res.text:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                texts = [t.text for t in soup.find_all('text')]
-                if texts:
-                    return " ".join(texts)
-        except Exception:
-            pass
-
-        # フォールバック: 公式モジュール
-        from youtube_transcript_api import YouTubeTranscriptApi
-        try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-            try:
-                transcript = transcript_list.find_transcript(['en', 'ja', 'en-US', 'en-GB'])
-            except:
-                transcript = transcript_list.find_transcript(['ja', 'en'])
-            return " ".join([t['text'] for t in transcript.fetch()])
-        except Exception:
-            pass
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
             
-        return "（※YouTube側のブロックにより字幕データにアクセスできませんでした）"
+        subs = info.get('subtitles', {})
+        auto_subs = info.get('automatic_captions', {})
+        
+        target_url = None
+        for lang in ['en', 'en-US', 'en-GB', 'ja']:
+            if lang in subs:
+                for fmt in subs[lang]:
+                    if fmt.get('ext') == 'json3':
+                        target_url = fmt.get('url')
+                        break
+                if target_url: break
+        
+        if not target_url:
+            for lang in ['en', 'en-US', 'en-GB', 'ja']:
+                if lang in auto_subs:
+                    for fmt in auto_subs[lang]:
+                        if fmt.get('ext') == 'json3':
+                            target_url = fmt.get('url')
+                            break
+                    if target_url: break
+                    
+        if not target_url:
+            return "（※字幕データが存在しないか、取得可能な形式が見つかりませんでした）"
+            
+        res = requests.get(target_url, timeout=20)
+        data = res.json()
+        transcript_text = ""
+        for ev in data.get('events', []):
+            for s in ev.get('segs', []):
+                transcript_text += s.get('utf8', '')
+                
+        if not transcript_text.strip():
+            return "（※字幕の内容が空でした）"
+            
+        return transcript_text.strip()
     except Exception as e:
-        return f"（※字幕パースエラー: {str(e)}）"
+        return f"（※yt-dlp抽出エラー: {str(e)}）"
 
 def async_process_ai(user_id: str, original_url: str, host_url: str):
     content_sources = []
