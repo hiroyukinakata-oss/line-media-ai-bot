@@ -4,7 +4,6 @@ import json
 import re
 import uuid
 import requests
-import urllib3
 from urllib.parse import urlparse
 from flask import Flask, request, abort, render_template_string, Response
 from linebot.v3 import WebhookHandler
@@ -18,20 +17,12 @@ from google import genai
 from youtube_transcript_api import YouTubeTranscriptApi
 from bs4 import BeautifulSoup
 
-# --- SSL証明書エラーを回避するためのパッチ処理 ---
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-_orig_request = requests.Session.request
-def _patched_request(*args, **kwargs):
-    kwargs['verify'] = False
-    return _orig_request(*args, **kwargs)
-requests.Session.request = _patched_request
-# ------------------------------------------------
-
 app = Flask(__name__)
 
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -85,17 +76,11 @@ def get_youtube_transcript(url: str) -> str:
         
         video_id = match.group(1)
         
-        # ScraperAPIによるプロキシ（中継）設定
-        scraper_api_key = os.environ.get("SCRAPER_API_KEY")
-        proxies = None
-        if scraper_api_key and scraper_api_key.strip() != "":
-            proxy_url = f"http://scraperapi:{scraper_api_key}@proxy-server.scraperapi.com:8001"
-            proxies = {"http": proxy_url, "https": proxy_url}
-        
+        # プロキシ（ScraperAPI）がYouTubeの内部XML通信を破壊し「no element found」エラーを引き起こすため、
+        # 字幕取得はプロキシを経由せず直接取得するよう分離・修正
         transcript = YouTubeTranscriptApi.get_transcript(
             video_id, 
-            languages=['ja', 'en', 'en-US', 'en-GB'],
-            proxies=proxies
+            languages=['ja', 'en', 'en-US', 'en-GB']
         )
         
         return " ".join([t['text'] for t in transcript])
@@ -104,10 +89,18 @@ def get_youtube_transcript(url: str) -> str:
 
 def scrape_webpage(url: str) -> str:
     try:
-        with requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10) as res:
-            res.encoding = res.apparent_encoding
-            soup = BeautifulSoup(res.text, 'html.parser')
-            return soup.get_text(separator=' ', strip=True)
+        # 一般のWeb記事取得にはIPブロック回避能力が高いScraperAPIを適用
+        if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
+            api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={url}"
+            with requests.get(api_url, timeout=20) as res:
+                res.encoding = res.apparent_encoding
+                soup = BeautifulSoup(res.text, 'html.parser')
+                return soup.get_text(separator=' ', strip=True)
+        else:
+            with requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10) as res:
+                res.encoding = res.apparent_encoding
+                soup = BeautifulSoup(res.text, 'html.parser')
+                return soup.get_text(separator=' ', strip=True)
     except Exception as e:
         return f"（※記事の取得に失敗しました: {str(e)}）"
 
