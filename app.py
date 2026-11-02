@@ -4,6 +4,7 @@ import json
 import re
 import uuid
 import requests
+import urllib.parse
 from urllib.parse import urlparse
 from flask import Flask, request, abort, render_template_string, Response
 from linebot.v3 import WebhookHandler
@@ -15,13 +16,13 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from google import genai
 from bs4 import BeautifulSoup
-from youtube_transcript_api import YouTubeTranscriptApi
 
 app = Flask(__name__)
 
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -64,32 +65,88 @@ def extract_x_data(url: str):
 
 def scrape_webpage(url: str) -> str:
     try:
-        with requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10) as res:
-            res.encoding = res.apparent_encoding
-            soup = BeautifulSoup(res.text, 'html.parser')
-            return soup.get_text(separator=' ', strip=True)
+        if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
+            encoded_url = urllib.parse.quote(url, safe='')
+            api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={encoded_url}"
+            with requests.get(api_url, timeout=20) as res:
+                res.encoding = res.apparent_encoding
+                soup = BeautifulSoup(res.text, 'html.parser')
+                return soup.get_text(separator=' ', strip=True)
+        else:
+            with requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10) as res:
+                res.encoding = res.apparent_encoding
+                soup = BeautifulSoup(res.text, 'html.parser')
+                return soup.get_text(separator=' ', strip=True)
     except Exception as e:
-        return f"（※記事取得失敗: {str(e)}）"
+        return f"（※記事の取得に失敗しました: {str(e)}）"
 
 def get_youtube_transcript(url: str) -> str:
     try:
         match = re.search(r'(?:youtu\.be/|youtube\.com/(?:watch\?(?:.*&)?v=|embed/|v/|shorts/|live/))([^&?/\s]+)', url)
         if not match: return "（※動画ID検出不可）"
         video_id = match.group(1)
+        target_url = f"https://www.youtube.com/watch?v={video_id}"
+
+        # URLの切断を防ぐため完全にエンコードしてプロキシへ渡す
+        if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
+            encoded_url = urllib.parse.quote(target_url, safe='')
+            api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={encoded_url}"
+        else:
+            api_url = target_url
+
+        res = requests.get(api_url, timeout=30)
         
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        try:
-            # 英語または日本語の字幕を優先して取得
-            transcript = transcript_list.find_transcript(['en', 'ja', 'en-US', 'en-GB'])
-            return " ".join([t['text'] for t in transcript.fetch()])
-        except:
-            # 見つからなければ取得可能な最初の言語を返す
-            for t in transcript_list:
-                return " ".join([item['text'] for item in t.fetch()])
-        return "（※字幕データが見つかりません）"
-    except Exception:
-        # エラーでクラッシュさせず、Xのテキスト解析へスムーズに移行する
-        return "（※YouTube側のアクセス制限により字幕が取得できませんでした。Xの投稿本文や記事内容を中心に解析を行います）"
+        # 構造化されたJSONデータを確実に抽出
+        json_match = re.search(r'ytInitialPlayerResponse\s*=\s*({.+?});', res.text)
+        if not json_match:
+            return "（※YouTubeの内部データ構造が見つかりませんでした）"
+
+        player_response = json.loads(json_match.group(1))
+        captions = player_response.get('captions', {}).get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
+
+        if not captions:
+            return "（※この動画には字幕データが存在しません）"
+
+        # 英語を優先し、なければ日本語、その他を取得（海外情報の翻訳特化）
+        track_url = captions[0]['baseUrl']
+        for c in captions:
+            lang = c.get('languageCode', '')
+            if 'en' in lang:
+                track_url = c['baseUrl']
+                break
+            elif 'ja' in lang:
+                track_url = c['baseUrl']
+
+        # 字幕URLもパラメータを含むためエンコード必須
+        if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
+            encoded_track_url = urllib.parse.quote(track_url, safe='')
+            track_api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={encoded_track_url}"
+        else:
+            track_api_url = track_url
+
+        res_track = requests.get(track_api_url, timeout=30)
+        
+        # XML形式のパース
+        soup = BeautifulSoup(res_track.text, 'html.parser')
+        transcript_text = " ".join([t.text for t in soup.find_all('text')])
+        
+        # XMLで取得できない場合はJSON形式としてパース
+        if not transcript_text.strip():
+            try:
+                track_data = res_track.json()
+                transcript_text = ""
+                for ev in track_data.get('events', []):
+                    for s in ev.get('segs', []):
+                        transcript_text += s.get('utf8', '')
+            except:
+                pass
+
+        if not transcript_text.strip():
+            return f"（※字幕データは取得できましたが内容が空でした。ステータス: {res_track.status_code}）"
+
+        return transcript_text.strip()
+    except Exception as e:
+        return f"（※字幕パースエラー: {str(e)}）"
 
 def async_process_ai(user_id: str, original_url: str, host_url: str):
     content_sources = []
@@ -97,46 +154,46 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
     
     if "x.com" in original_url or "twitter.com" in original_url:
         x_text, extracted_urls = extract_x_data(original_url)
-        if x_text:
-            content_sources.append(f"【X(Twitter)の投稿内容】\n{x_text}")
-        trace_log.append(f"🔍 検出URL: {extracted_urls}")
+        if x_text and not x_text.startswith("（※"):
+            content_sources.append(f"【Xの英語投稿内容】\n{x_text}")
+        trace_log.append(f"🔍 検出された内部URL: {extracted_urls}")
         
         for url in extracted_urls:
             if 'youtu' in url or 'youtube.com' in url:
-                trace_log.append(f"▶ YouTube処理: {url}")
+                trace_log.append(f"▶ YouTube字幕抽出: {url}")
                 ts = get_youtube_transcript(url)
-                content_sources.append(f"【動画字幕({url})】\n{ts[:100000]}")
+                content_sources.append(f"【動画字幕({url})】\n{ts[:300000]}")
             else:
-                trace_log.append(f"📄 外部記事処理: {url}")
+                trace_log.append(f"📄 外部記事抽出: {url}")
                 text = scrape_webpage(url)
-                content_sources.append(f"【記事内容({url})】\n{text[:50000]}")
+                content_sources.append(f"【記事内容({url})】\n{text[:100000]}")
     else:
-        trace_log.append(f"🔍 直接入力URL: {original_url}")
+        trace_log.append(f"🔍 直接入力されたURL: {original_url}")
         if 'youtu' in original_url or 'youtube.com' in original_url:
             ts = get_youtube_transcript(original_url)
-            content_sources.append(f"【動画字幕】\n{ts[:100000]}")
+            content_sources.append(f"【動画字幕({original_url})】\n{ts[:300000]}")
         else:
             text = scrape_webpage(original_url)
-            content_sources.append(f"【記事内容】\n{text[:50000]}")
+            content_sources.append(f"【記事内容({original_url})】\n{text[:100000]}")
 
     content_sources.insert(0, f"【システム処理ログ】\n" + "\n".join(trace_log))
     combined_text = "\n\n".join(content_sources)
 
-    # 越境EC事業・自動化を見据えた専用プロンプト
+    # 無在庫販売・事業自動化に特化したAIプロンプト
     prompt = f"""
-    あなたは最先端のAIトレンドを分析し、事業実装をサポートする専門エージェントです。
-    以下の抽出データ（Xの英語投稿、海外YouTube動画の字幕、Web記事など）を読み解き、予備知識のない状態でも完全に理解できる【深掘り解説レポート】を日本語で作成してください。
+    あなたは海外の最新AIトレンドを解析し、事業実装をサポートする専門エージェントです。
+    以下の抽出データ（Xの英語投稿、海外YouTube動画の字幕、Web記事など）を読み解き、英語の一次情報を完全に日本語化・体系化した【深掘り解説レポート】を作成してください。
 
-    主な目的は、この英語の最新情報を「越境ECや無在庫販売システム（eBay/Shopee等）の半自動化・AIエージェント活用事業」にどう応用できるかという視点を持つことです。
+    特に、この情報を「越境ECや無在庫販売システム（eBay/Shopee等）の半自動化、およびAIエージェントを活用した事業効率化」にどのように応用できるかという視点を必ず盛り込んでください。
 
     【抽出データ】
     {combined_text}
 
     以下の構成でMarkdown形式で出力してください。
-    # 1. 【要約】この情報が伝えたかった最大のテーマ
-    # 2. 【詳細解説】具体的に何が語られていたか？（英語情報の日本語訳と徹底解剖）
-    # 3. 【ビジネス応用】EC半自動化やAIエージェント構築への具体的な活用アイデア
-    # 4. まとめとネクストアクション
+    # 1. 【要約】この情報が伝えたかった最大のテーマ（日本語訳）
+    # 2. 【詳細解説】動画や記事で具体的に何が語られていたか？（重要ポイントと手法の徹底解剖）
+    # 3. 【事業応用】EC半自動化やAIエージェント構築への具体的な活用アイデア・ヒント
+    # 4. 今後のアクション・まとめ
     """
     
     try:
@@ -144,7 +201,7 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
         report_id = str(uuid.uuid4())
         summary_db[report_id] = {"summary": response.text, "raw_text": combined_text}
         report_url = f"{host_url.rstrip('/')}/report/{report_id}"
-        reply_msg = f"✅ レポートが完成しました。\n以下の専用ページからご確認ください。\n{report_url}"
+        reply_msg = f"✅ 処理が完了しました。\n以下の専用ページからご確認ください。\n{report_url}"
         
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=reply_msg)]))
@@ -165,7 +222,7 @@ def view_report(report_id):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>AI 事業応用レポート</title>
+        <title>AI 事業応用解説レポート</title>
         <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
         <style>
             body { font-family: sans-serif; line-height: 1.8; padding: 15px; max-width: 900px; margin: 0 auto; background: #f4f7f6; color: #333;}
