@@ -49,10 +49,7 @@ def extract_x_data(url: str):
                     try:
                         data = res.json()
                         text = data.get("text", "")
-                        
-                        if "qrtURL" in data:
-                            text += f" {data['qrtURL']}"
-                            
+                        if "qrtURL" in data: text += f" {data['qrtURL']}"
                         raw_urls = re.findall(r'(https?://[^\s]+)', text)
                         for r_url in raw_urls:
                             r_url = r_url.rstrip(').,;!?')
@@ -68,60 +65,52 @@ def extract_x_data(url: str):
     return text, expanded_urls
 
 def get_youtube_transcript(url: str) -> str:
-    # 完全に独自開発したIPブロック回避・安定版取得ロジック
     try:
         match = re.search(r'(?:youtu\.be/|youtube\.com/(?:watch\?(?:.*&)?v=|embed/|v/|shorts/|live/))([^&?/\s]+)', url)
-        if not match:
-            return "（※YouTubeの動画IDが検出できませんでした）"
+        if not match: return "（※YouTubeの動画IDが検出できませんでした）"
         
         video_id = match.group(1)
         target_url = f"https://www.youtube.com/watch?v={video_id}"
         
-        # 1. ScraperAPIの強力なREST API経由でYouTube本体のHTMLを取得
         if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
             api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={target_url}"
         else:
             api_url = target_url
             
-        res = requests.get(api_url, timeout=20)
+        res = requests.get(api_url, timeout=30)
         
-        # 2. HTMLの奥深くから、字幕データ専用の直リンク（baseUrl）を正規表現で抽出
-        urls = re.findall(r'"baseUrl":"(https://www\.youtube\.com/api/timedtext[^"]+)"', res.text)
+        # 【修正箇所】エスケープ文字を含むURLも漏らさず抽出する検索ルールに変更
+        urls = re.findall(r'"baseUrl":"([^"]+timedtext[^"]+)"', res.text)
         if not urls:
-            return "（※この動画には字幕データが存在しないか、設定でオフになっています）"
+            return "（※字幕データへのリンクが見つかりませんでした。動画に字幕がないか、プロキシがブロックされました）"
             
-        # URLのエンコード文字を修正
-        decoded_urls = [u.replace('\\u0026', '&') for u in urls]
+        decoded_urls = [u.replace('\\u0026', '&').replace('\\/', '/').replace('\\\\', '\\') for u in urls]
         
-        # 日本語字幕を最優先で探索
         track_url = decoded_urls[0]
         for u in decoded_urls:
             if 'lang=ja' in u:
                 track_url = u
                 break
                 
-        # 3. 字幕データ本体もScraperAPI経由で安全に取得
         if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
             track_api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={track_url}"
         else:
             track_api_url = track_url
             
-        res_track = requests.get(track_api_url, timeout=20)
+        res_track = requests.get(track_api_url, timeout=30)
         
-        # 4. JSON形式・XML形式の両方に対応した字幕テキストの抽出
         transcript_text = ""
         try:
             data = res_track.json()
-            events = data.get('events', [])
-            for ev in events:
+            for ev in data.get('events', []):
                 for s in ev.get('segs', []):
-                    transcript_text += s.get('utf8', '') + " "
-        except Exception:
+                    transcript_text += s.get('utf8', '')
+        except:
             soup = BeautifulSoup(res_track.text, 'html.parser')
-            transcript_text = " ".join([t.text for t in soup.find_all('text')])
+            transcript_text = "".join([t.text for t in soup.find_all('text')])
             
         if not transcript_text.strip():
-            return "（※字幕の内容が空でした）"
+            return "（※字幕データを取得しましたが、テキストが空でした）"
             
         return transcript_text.strip()
     except Exception as e:
@@ -153,7 +142,6 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
             content_sources.append(f"【Xの投稿内容】\n{x_text}")
         else:
             trace_log.append(f"⚠️ Xデータエラー: {x_text}")
-        
         trace_log.append(f"🔍 検出された内部URL: {extracted_urls}")
         
         for url in extracted_urls:
@@ -208,25 +196,14 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
     try:
         response = gemini_client.models.generate_content(model='gemini-3.6-flash', contents=prompt)
         report_id = str(uuid.uuid4())
-        
-        summary_db[report_id] = {
-            "summary": response.text,
-            "raw_text": combined_text
-        }
-        
+        summary_db[report_id] = {"summary": response.text, "raw_text": combined_text}
         report_url = f"{host_url.rstrip('/')}/report/{report_id}"
-        
         reply_msg = f"✅ 処理が完了しました。\n以下の専用ページからご確認ください。\n{report_url}"
-        
         with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).push_message(PushMessageRequest(
-                to=user_id, messages=[TextMessage(text=reply_msg)]
-            ))
+            MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=reply_msg)]))
     except Exception as e:
         with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).push_message(PushMessageRequest(
-                to=user_id, messages=[TextMessage(text=f"エラー: {str(e)}")]
-            ))
+            MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=f"エラー: {str(e)}")]))
 
 @app.route("/", methods=["GET"])
 def health_check(): return "OK"
@@ -234,9 +211,7 @@ def health_check(): return "OK"
 @app.route("/report/<report_id>", methods=["GET"])
 def view_report(report_id):
     data = summary_db.get(report_id)
-    if not data:
-        return "<h1>レポートの有効期限が切れたか、見つかりません。URLを再度送信して再生成してください。</h1>", 404
-        
+    if not data: return "<h1>レポートが見つかりません。</h1>", 404
     template = """
     <!DOCTYPE html>
     <html lang="ja">
@@ -246,9 +221,8 @@ def view_report(report_id):
         <title>AI 深掘り解説レポート</title>
         <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
         <style>
-            body { font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Hiragino Sans", Meiryo, sans-serif; line-height: 1.8; padding: 15px; max-width: 900px; margin: 0 auto; background: #f4f7f6; color: #333;}
+            body { font-family: sans-serif; line-height: 1.8; padding: 15px; max-width: 900px; margin: 0 auto; background: #f4f7f6; color: #333;}
             .container { background: #fff; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); margin-bottom: 20px;}
-            
             .action-card { background: #e8f5e9; border: 2px solid #a5d6a7; border-radius: 10px; padding: 15px; margin-bottom: 20px; }
             .action-title { font-weight: bold; font-size: 1.05em; color: #1b5e20; margin-bottom: 10px; }
             .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
@@ -256,17 +230,8 @@ def view_report(report_id):
             .btn-primary { background: #2e7d32; color: #fff; }
             .btn-secondary { background: #37474f; color: #fff; }
             .btn-outline { background: #fff; color: #2e7d32; border: 1px solid #2e7d32; }
-            .btn:active { opacity: 0.7; }
-            
             h1 { font-size: 1.4em; border-bottom: 3px solid #3498db; padding-bottom: 8px; margin-top: 30px; color: #2c3e50;}
             h2 { font-size: 1.2em; border-left: 5px solid #3498db; padding-left: 12px; margin-top: 25px; color: #34495e;}
-            h3 { font-size: 1.05em; color: #7f8c8d; margin-top: 20px;}
-            p { font-size: 1em; margin-bottom: 15px; }
-            ul, ol { font-size: 1em; margin-bottom: 15px; padding-left: 20px;}
-            li { margin-bottom: 8px; }
-            strong { color: #e74c3c; }
-            code { background: #f8f9fa; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; color: #e83e8c;}
-            
             #toast { visibility: hidden; min-width: 200px; background-color: #333; color: #fff; text-align: center; border-radius: 8px; padding: 12px; position: fixed; z-index: 9999; left: 50%; bottom: 30px; transform: translateX(-50%); font-size: 0.9em;}
             #toast.show { visibility: visible; }
         </style>
@@ -280,33 +245,24 @@ def view_report(report_id):
                 <a class="btn btn-outline" href="/download/{{ report_id }}/txt" target="_blank">📄 要約 (.txt) 保存</a>
                 <a class="btn btn-outline" href="/download/{{ report_id }}/raw" target="_blank">📦 生データ 保存</a>
             </div>
-            <div style="font-size: 0.8em; color: #555; text-align: center;">※「コピー」を押すとメモ帳等にすぐ貼り付けできます</div>
         </div>
-
         <div class="container" id="content"></div>
         <div id="toast">コピーしました！</div>
-
         <textarea id="raw-markdown" style="display:none;">{{ summary }}</textarea>
         <textarea id="raw-data" style="display:none;">{{ raw_text }}</textarea>
         <script>
             const rawText = document.getElementById('raw-markdown').value;
             const rawData = document.getElementById('raw-data').value;
             document.getElementById('content').innerHTML = marked.parse(rawText);
-
             function showToast(msg) {
                 const toast = document.getElementById("toast");
                 toast.innerText = msg;
                 toast.className = "show";
                 setTimeout(() => { toast.className = toast.className.replace("show", ""); }, 2000);
             }
-
             function copyText(type) {
                 const text = (type === 'summary') ? rawText : rawData;
-                navigator.clipboard.writeText(text).then(() => {
-                    showToast(type === 'summary' ? "要約テキストをコピーしました！" : "生データをコピーしました！");
-                }).catch(() => {
-                    showToast("コピーに失敗しました");
-                });
+                navigator.clipboard.writeText(text).then(() => { showToast(type === 'summary' ? "要約テキストをコピーしました！" : "生データをコピーしました！"); });
             }
         </script>
     </body>
@@ -317,18 +273,14 @@ def view_report(report_id):
 @app.route("/download/<report_id>/<file_type>", methods=["GET"])
 def download_file(report_id, file_type):
     data = summary_db.get(report_id)
-    if not data:
-        return "Not Found", 404
-
+    if not data: return "Not Found", 404
     if file_type == "txt":
         content = data["summary"].replace("#", "").replace("*", "")
         filename = "ai_summary.txt"
     elif file_type == "raw":
         content = data["raw_text"]
         filename = "raw_extracted_data.txt"
-    else:
-        return "Bad Request", 400
-
+    else: return "Bad Request", 400
     response = Response(content, mimetype="text/plain; charset=utf-8")
     response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
     return response
@@ -346,18 +298,10 @@ def handle_message(event):
     user_text = event.message.text.strip()
     if not user_text.startswith("http"):
         with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).reply_message(ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text="動画や記事のURLを送信してください。")]
-            ))
+            MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text="動画や記事のURLを送信してください。")]))
         return
-
     with ApiClient(configuration) as api_client:
-        MessagingApi(api_client).reply_message(ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[TextMessage(text="🔍 大元の動画・記事のデータを読み込み、徹底解説レポートを作成中です...\n（非常に深い内容を生成するため、1分〜2分ほどかかります。少々お待ちください）")]
-        ))
-        
+        MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text="🔍 大元の動画・記事のデータを読み込み、徹底解説レポートを作成中です...\n（非常に深い内容を生成するため、1分〜2分ほどかかります。少々お待ちください）")]))
     threading.Thread(target=async_process_ai, args=(event.source.user_id, user_text, request.host_url)).start()
 
 if __name__ == "__main__":
