@@ -87,7 +87,13 @@ def get_youtube_transcript(url: str) -> str:
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
+        'nocheckcertificate': True, # プロキシ経由時のSSLエラーを回避
     }
+    
+    # yt-dlpのアクセスをScraperAPI経由に偽装し、YouTubeのBotブロック（ログイン要求）を回避
+    if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
+        ydl_opts['proxy'] = f"http://scraperapi:{SCRAPER_API_KEY}@proxy-server.scraperapi.com:8001"
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -116,7 +122,14 @@ def get_youtube_transcript(url: str) -> str:
         if not target_url:
             return "（※字幕データが存在しないか、取得可能な形式が見つかりませんでした）"
             
-        res = requests.get(target_url, timeout=20)
+        # 抽出した字幕データへの直接アクセスもScraperAPIを経由してIPブロックを防ぐ
+        if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
+            encoded_target_url = urllib.parse.quote(target_url, safe='')
+            api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={encoded_target_url}"
+        else:
+            api_url = target_url
+            
+        res = requests.get(api_url, timeout=30)
         data = res.json()
         transcript_text = ""
         for ev in data.get('events', []):
