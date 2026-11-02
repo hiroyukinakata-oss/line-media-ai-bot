@@ -74,13 +74,21 @@ def get_youtube_transcript(url: str) -> str:
             return "（※YouTubeの動画IDが検出できませんでした）"
         
         video_id = match.group(1)
-        # ライブラリの最新仕様に合わせた記述に変更
-        yt_api = YouTubeTranscriptApi()
-        transcript_list = yt_api.list(video_id)
-        transcript = transcript_list.find_transcript(['ja', 'en', 'en-US', 'en-GB'])
-        fetched = transcript.fetch()
         
-        return " ".join([t['text'] for t in fetched])
+        # ScraperAPIによるプロキシ（中継）設定（Renderの環境変数から安全に読み込みます）
+        scraper_api_key = os.environ.get("SCRAPER_API_KEY")
+        proxies = None
+        if scraper_api_key and scraper_api_key.strip() != "":
+            proxy_url = f"http://scraperapi:{scraper_api_key}@proxy-server.scraperapi.com:8001"
+            proxies = {"http": proxy_url, "https": proxy_url}
+        
+        transcript = YouTubeTranscriptApi.get_transcript(
+            video_id, 
+            languages=['ja', 'en', 'en-US', 'en-GB'],
+            proxies=proxies
+        )
+        
+        return " ".join([t['text'] for t in transcript])
     except Exception as e:
         return f"（※字幕データの取得に失敗しました: {str(e)}）"
 
