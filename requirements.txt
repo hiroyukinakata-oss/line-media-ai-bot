@@ -1,7 +1,8 @@
 Flask==3.0.0
 line-bot-sdk==3.5.0
 google-genai==0.3.0
+youtube-transcript-api==0.6.2
 beautifulsoup4==4.12.2
 requests==2.31.0
 gunicorn==21.2.0
-yt-dlp==2024.10.22
+yt-dlp
