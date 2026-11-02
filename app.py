@@ -87,7 +87,6 @@ def get_youtube_transcript(url: str) -> str:
         video_id = match.group(1)
         target_url = f"https://www.youtube.com/watch?v={video_id}"
 
-        # URLの切断を防ぐため完全にエンコードしてプロキシへ渡す
         if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
             encoded_url = urllib.parse.quote(target_url, safe='')
             api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={encoded_url}"
@@ -96,7 +95,6 @@ def get_youtube_transcript(url: str) -> str:
 
         res = requests.get(api_url, timeout=30)
         
-        # 構造化されたJSONデータを確実に抽出
         json_match = re.search(r'ytInitialPlayerResponse\s*=\s*({.+?});', res.text)
         if not json_match:
             return "（※YouTubeの内部データ構造が見つかりませんでした）"
@@ -107,7 +105,6 @@ def get_youtube_transcript(url: str) -> str:
         if not captions:
             return "（※この動画には字幕データが存在しません）"
 
-        # 英語を優先し、なければ日本語、その他を取得（海外情報の翻訳特化）
         track_url = captions[0]['baseUrl']
         for c in captions:
             lang = c.get('languageCode', '')
@@ -117,7 +114,6 @@ def get_youtube_transcript(url: str) -> str:
             elif 'ja' in lang:
                 track_url = c['baseUrl']
 
-        # 字幕URLもパラメータを含むためエンコード必須
         if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
             encoded_track_url = urllib.parse.quote(track_url, safe='')
             track_api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={encoded_track_url}"
@@ -126,11 +122,9 @@ def get_youtube_transcript(url: str) -> str:
 
         res_track = requests.get(track_api_url, timeout=30)
         
-        # XML形式のパース
         soup = BeautifulSoup(res_track.text, 'html.parser')
         transcript_text = " ".join([t.text for t in soup.find_all('text')])
         
-        # XMLで取得できない場合はJSON形式としてパース
         if not transcript_text.strip():
             try:
                 track_data = res_track.json()
@@ -151,35 +145,62 @@ def get_youtube_transcript(url: str) -> str:
 def async_process_ai(user_id: str, original_url: str, host_url: str):
     content_sources = []
     trace_log = [] 
+    has_valid_content = False
+    critical_error_msg = None
     
     if "x.com" in original_url or "twitter.com" in original_url:
         x_text, extracted_urls = extract_x_data(original_url)
         if x_text and not x_text.startswith("（※"):
             content_sources.append(f"【Xの英語投稿内容】\n{x_text}")
+            has_valid_content = True
         trace_log.append(f"🔍 検出された内部URL: {extracted_urls}")
         
         for url in extracted_urls:
             if 'youtu' in url or 'youtube.com' in url:
                 trace_log.append(f"▶ YouTube字幕抽出: {url}")
                 ts = get_youtube_transcript(url)
-                content_sources.append(f"【動画字幕({url})】\n{ts[:300000]}")
+                if ts.startswith("（※"):
+                    critical_error_msg = ts
+                else:
+                    content_sources.append(f"【動画字幕({url})】\n{ts[:300000]}")
+                    has_valid_content = True
             else:
                 trace_log.append(f"📄 外部記事抽出: {url}")
                 text = scrape_webpage(url)
-                content_sources.append(f"【記事内容({url})】\n{text[:100000]}")
+                if not text.startswith("（※"):
+                    content_sources.append(f"【記事内容({url})】\n{text[:100000]}")
+                    has_valid_content = True
     else:
         trace_log.append(f"🔍 直接入力されたURL: {original_url}")
         if 'youtu' in original_url or 'youtube.com' in original_url:
             ts = get_youtube_transcript(original_url)
-            content_sources.append(f"【動画字幕({original_url})】\n{ts[:300000]}")
+            if ts.startswith("（※"):
+                critical_error_msg = ts
+            else:
+                content_sources.append(f"【動画字幕({original_url})】\n{ts[:300000]}")
+                has_valid_content = True
         else:
             text = scrape_webpage(original_url)
-            content_sources.append(f"【記事内容({original_url})】\n{text[:100000]}")
+            if not text.startswith("（※"):
+                content_sources.append(f"【記事内容({original_url})】\n{text[:100000]}")
+                has_valid_content = True
+
+    # 厳格なエラーハンドリング：取得失敗時はレポートを作らず強制終了
+    if critical_error_msg:
+        reply_msg = f"⚠️ エラー：動画の字幕取得に失敗しました。\n詳細: {critical_error_msg}\n\n※事実に基づかない推測レポートの作成を防ぐため、処理を中断しました。"
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=reply_msg)]))
+        return
+        
+    if not has_valid_content:
+        reply_msg = "⚠️ エラー：有効なテキストデータ（投稿、字幕、記事）を一切取得できませんでした。処理を中断します。"
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=reply_msg)]))
+        return
 
     content_sources.insert(0, f"【システム処理ログ】\n" + "\n".join(trace_log))
     combined_text = "\n\n".join(content_sources)
 
-    # 無在庫販売・事業自動化に特化したAIプロンプト
     prompt = f"""
     あなたは海外の最新AIトレンドを解析し、事業実装をサポートする専門エージェントです。
     以下の抽出データ（Xの英語投稿、海外YouTube動画の字幕、Web記事など）を読み解き、英語の一次情報を完全に日本語化・体系化した【深掘り解説レポート】を作成してください。
