@@ -75,7 +75,7 @@ def scrape_webpage(url: str) -> str:
             res.encoding = res.apparent_encoding
             soup = BeautifulSoup(res.text, 'html.parser')
             return soup.get_text(separator=' ', strip=True)
-    except Exception as e:
+    except Exception as e: # ← ここを修正しました (as e)
         return f"（※記事の取得に失敗しました: {str(e)}）"
 
 def get_youtube_transcript(url: str) -> str:
@@ -221,4 +221,67 @@ def view_report(report_id):
             <div class="btn-grid">
                 <button class="btn btn-primary" onclick="copyText('summary')">📋 要約をコピー</button>
                 <button class="btn btn-secondary" onclick="copyText('raw')">📋 生データをコピー</button>
-                <a class="btn btn-outline" href="/download/{{ report_id }
+                <a class="btn btn-outline" href="/download/{{ report_id }}/txt" target="_blank">📄 要約 (.txt) 保存</a>
+                <a class="btn btn-outline" href="/download/{{ report_id }}/raw" target="_blank">📦 生データ 保存</a>
+            </div>
+        </div>
+        <div class="container" id="content"></div>
+        <div id="toast">コピーしました！</div>
+        <textarea id="raw-markdown" style="display:none;">{{ summary }}</textarea>
+        <textarea id="raw-data" style="display:none;">{{ raw_text }}</textarea>
+        <script>
+            const rawText = document.getElementById('raw-markdown').value;
+            const rawData = document.getElementById('raw-data').value;
+            document.getElementById('content').innerHTML = marked.parse(rawText);
+            function showToast(msg) {
+                const toast = document.getElementById("toast");
+                toast.innerText = msg;
+                toast.className = "show";
+                setTimeout(() => { toast.className = toast.className.replace("show", ""); }, 2000);
+            }
+            function copyText(type) {
+                const text = (type === 'summary') ? rawText : rawData;
+                navigator.clipboard.writeText(text).then(() => { showToast(type === 'summary' ? "要約テキストをコピーしました！" : "生データをコピーしました！"); });
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(template, report_id=report_id, summary=data["summary"], raw_text=data["raw_text"])
+
+@app.route("/download/<report_id>/<file_type>", methods=["GET"])
+def download_file(report_id, file_type):
+    data = summary_db.get(report_id)
+    if not data: return "Not Found", 404
+    if file_type == "txt":
+        content = data["summary"].replace("#", "").replace("*", "")
+        filename = "ai_summary.txt"
+    elif file_type == "raw":
+        content = data["raw_text"]
+        filename = "raw_extracted_data.txt"
+    else: return "Bad Request", 400
+    response = Response(content, mimetype="text/plain; charset=utf-8")
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
+
+@app.route("/callback", methods=["POST"])
+def callback():
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+    try: handler.handle(body, signature)
+    except InvalidSignatureError: abort(400)
+    return "OK"
+
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_message(event):
+    user_text = event.message.text.strip()
+    if not user_text.startswith("http"):
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text="動画や記事のURLを送信してください。")]))
+        return
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text="🔍 大元の動画・記事のデータを読み込み、徹底解説レポートを作成中です...\n（非常に深い内容を生成するため、1分〜2分ほどかかります。少々お待ちください）")]))
+    threading.Thread(target=async_process_ai, args=(event.source.user_id, user_text, request.host_url)).start()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
