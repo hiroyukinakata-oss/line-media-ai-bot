@@ -15,17 +15,16 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from google import genai
 from bs4 import BeautifulSoup
+from youtube_transcript_api import YouTubeTranscriptApi
 
 app = Flask(__name__)
 
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-# Gemini APIクライアントの初期化
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 summary_db = {}
@@ -58,127 +57,100 @@ def extract_x_data(url: str):
                             if e_url not in expanded_urls:
                                 expanded_urls.append(e_url)
                     except ValueError:
-                        text = "（※Xからのデータが不正な形式でした）"
-                else:
-                    text = f"（※Xデータ取得失敗: {res.status_code}）"
-    except Exception as e:
-        text = f"（※X通信エラー: {str(e)}）"
+                        pass
+    except Exception:
+        pass
     return text, expanded_urls
 
 def scrape_webpage(url: str) -> str:
     try:
-        if SCRAPER_API_KEY and SCRAPER_API_KEY.strip() != "":
-            api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={url}"
-            with requests.get(api_url, timeout=20) as res:
-                res.encoding = res.apparent_encoding
-                soup = BeautifulSoup(res.text, 'html.parser')
-                return soup.get_text(separator=' ', strip=True)
-        else:
-            with requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10) as res:
-                res.encoding = res.apparent_encoding
-                soup = BeautifulSoup(res.text, 'html.parser')
-                return soup.get_text(separator=' ', strip=True)
+        with requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10) as res:
+            res.encoding = res.apparent_encoding
+            soup = BeautifulSoup(res.text, 'html.parser')
+            return soup.get_text(separator=' ', strip=True)
     except Exception as e:
-        return f"（※記事の取得に失敗しました: {str(e)}）"
+        return f"（※記事取得失敗: {str(e)}）"
+
+def get_youtube_transcript(url: str) -> str:
+    try:
+        match = re.search(r'(?:youtu\.be/|youtube\.com/(?:watch\?(?:.*&)?v=|embed/|v/|shorts/|live/))([^&?/\s]+)', url)
+        if not match: return "（※動画ID検出不可）"
+        video_id = match.group(1)
+        
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        try:
+            # 英語または日本語の字幕を優先して取得
+            transcript = transcript_list.find_transcript(['en', 'ja', 'en-US', 'en-GB'])
+            return " ".join([t['text'] for t in transcript.fetch()])
+        except:
+            # 見つからなければ取得可能な最初の言語を返す
+            for t in transcript_list:
+                return " ".join([item['text'] for item in t.fetch()])
+        return "（※字幕データが見つかりません）"
+    except Exception:
+        # エラーでクラッシュさせず、Xのテキスト解析へスムーズに移行する
+        return "（※YouTube側のアクセス制限により字幕が取得できませんでした。Xの投稿本文や記事内容を中心に解析を行います）"
 
 def async_process_ai(user_id: str, original_url: str, host_url: str):
     content_sources = []
-    trace_log = []
-    youtube_video_uri = None
-
+    trace_log = [] 
+    
     if "x.com" in original_url or "twitter.com" in original_url:
         x_text, extracted_urls = extract_x_data(original_url)
-        if x_text and not x_text.startswith("（※"):
-            content_sources.append(f"【Xの投稿内容】\n{x_text}")
-        else:
-            trace_log.append(f"⚠️ Xデータエラー: {x_text}")
-        trace_log.append(f"🔍 検出された内部URL: {extracted_urls}")
-
+        if x_text:
+            content_sources.append(f"【X(Twitter)の投稿内容】\n{x_text}")
+        trace_log.append(f"🔍 検出URL: {extracted_urls}")
+        
         for url in extracted_urls:
             if 'youtu' in url or 'youtube.com' in url:
-                trace_log.append(f"▶ YouTube動画を検出: {url}")
-                youtube_video_uri = url
+                trace_log.append(f"▶ YouTube処理: {url}")
+                ts = get_youtube_transcript(url)
+                content_sources.append(f"【動画字幕({url})】\n{ts[:100000]}")
             else:
-                trace_log.append(f"📄 外部記事として処理: {url}")
+                trace_log.append(f"📄 外部記事処理: {url}")
                 text = scrape_webpage(url)
-                if text and not text.startswith("（※"):
-                    content_sources.append(f"【記事内容（{url}）】\n{text[:100000]}")
-                else:
-                    trace_log.append(f"⚠️ 記事エラー: {text}")
+                content_sources.append(f"【記事内容({url})】\n{text[:50000]}")
     else:
-        trace_log.append(f"🔍 直接入力されたURL: {original_url}")
+        trace_log.append(f"🔍 直接入力URL: {original_url}")
         if 'youtu' in original_url or 'youtube.com' in original_url:
-            trace_log.append(f"▶ YouTube動画を検出: {original_url}")
-            youtube_video_uri = original_url
+            ts = get_youtube_transcript(original_url)
+            content_sources.append(f"【動画字幕】\n{ts[:100000]}")
         else:
             text = scrape_webpage(original_url)
-            if text and not text.startswith("（※"):
-                content_sources.append(f"【記事内容（{original_url}）】\n{text[:100000]}")
-            else:
-                trace_log.append(f"⚠️ 記事エラー: {text}")
+            content_sources.append(f"【記事内容】\n{text[:50000]}")
 
     content_sources.insert(0, f"【システム処理ログ】\n" + "\n".join(trace_log))
     combined_text = "\n\n".join(content_sources)
 
-    # Geminiへのプロンプト設定
+    # 越境EC事業・自動化を見据えた専用プロンプト
     prompt = f"""
-    以下の抽出データ（システムログ、Xの投稿、動画解析結果、Web記事など）の内容をベースに、超特大ボリュームで、予備知識のない小学生や初心者でも「なるほど！そういう仕組みなんだ！」と完璧に理解できるレベルの【詳細な深掘り解説レポート】を作成してください。
+    あなたは最先端のAIトレンドを分析し、事業実装をサポートする専門エージェントです。
+    以下の抽出データ（Xの英語投稿、海外YouTube動画の字幕、Web記事など）を読み解き、予備知識のない状態でも完全に理解できる【深掘り解説レポート】を日本語で作成してください。
 
-    ※もし抽出データがシステムエラーのログのみで、肝心の内容が取得できていない場合は、「データの取得に失敗したため解説できません」という旨を優しく回答してください。
-    出力文字数や時間に制限はありません。出し惜しみせず徹底的に解説してください。
+    主な目的は、この英語の最新情報を「越境ECや無在庫販売システム（eBay/Shopee等）の半自動化・AIエージェント活用事業」にどう応用できるかという視点を持つことです。
 
     【抽出データ】
     {combined_text}
 
     以下の構成でMarkdown形式で出力してください。
-    # 1. 【超図解】この記事・動画が伝えたかった最大のテーマ
-    # 2. 【深掘り解説】具体的に何が語られていたか？（重要ポイントの徹底解剖）
-    # 3. 最新のAI・エージェント動向と、私たちへの影響
-    # 4. 今後のアクション・まとめ
+    # 1. 【要約】この情報が伝えたかった最大のテーマ
+    # 2. 【詳細解説】具体的に何が語られていたか？（英語情報の日本語訳と徹底解剖）
+    # 3. 【ビジネス応用】EC半自動化やAIエージェント構築への具体的な活用アイデア
+    # 4. まとめとネクストアクション
     """
-
+    
     try:
-        # YouTube動画が検出された場合、GeminiのInteractions APIを使用してURLから直接解析を行う
-        if youtube_video_uri:
-            # モデル名は実際に利用可能なものを指定 (例: gemini-3.6-flash, gemini-3.8-flash)
-            # GEMINI_MODEL環境変数が設定されていればそれを使用、なければデフォルトを使用
-            gemini_model = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash") 
-
-            interaction = gemini_client.interactions.create(
-                model=gemini_model,
-                input=[
-                    {
-                        "type": "video",
-                        "uri": youtube_video_uri
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt
-                    }
-                ]
-            )
-            response_text = interaction.output_text
-            if not response_text or not response_text.strip():
-                 raise RuntimeError("Geminiから有効なレポートが返りませんでした")
-            report = response_text.strip()
-            raw_data = f"YouTube解析結果: {youtube_video_uri}\n{combined_text}"
-            
-        else:
-            # 動画がない場合はテキスト入力のみで通常の生成処理
-            response = gemini_client.models.generate_content(model='gemini-3.6-flash', contents=prompt)
-            report = response.text
-            raw_data = combined_text
-
+        response = gemini_client.models.generate_content(model='gemini-3.6-flash', contents=prompt)
         report_id = str(uuid.uuid4())
-        summary_db[report_id] = {"summary": report, "raw_text": raw_data}
+        summary_db[report_id] = {"summary": response.text, "raw_text": combined_text}
         report_url = f"{host_url.rstrip('/')}/report/{report_id}"
-        reply_msg = f"✅ 処理が完了しました。\n以下の専用ページからご確認ください。\n{report_url}"
-
+        reply_msg = f"✅ レポートが完成しました。\n以下の専用ページからご確認ください。\n{report_url}"
+        
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=reply_msg)]))
     except Exception as e:
         with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=f"エラー: {str(e)}")]))
+            MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=f"エラー: {str(e)}")] ))
 
 @app.route("/", methods=["GET"])
 def health_check(): return "OK"
@@ -193,7 +165,7 @@ def view_report(report_id):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>AI 深掘り解説レポート</title>
+        <title>AI 事業応用レポート</title>
         <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
         <style>
             body { font-family: sans-serif; line-height: 1.8; padding: 15px; max-width: 900px; margin: 0 auto; background: #f4f7f6; color: #333;}
