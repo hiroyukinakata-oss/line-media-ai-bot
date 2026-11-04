@@ -4,6 +4,7 @@ import json
 import re
 import uuid
 import requests
+import time
 from urllib.parse import urlparse
 from flask import Flask, request, abort, render_template_string, Response
 from linebot.v3 import WebhookHandler
@@ -155,19 +156,38 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
     # 3. 【抽出データ（生データ）のハイライト】元データから読み取れる重要ファクト
     """
     
-    try:
-        # エラーメッセージの指示通りに gemini-3.8-flash へ変更
-        response = gemini_client.models.generate_content(model='gemini-3.8-flash', contents=prompt)
+    max_retries = 3
+    ai_response = None
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            ai_response = gemini_client.models.generate_content(model='gemini-3.8-flash', contents=prompt)
+            break
+        except Exception as e:
+            last_error = str(e)
+            if "503" in last_error or "UNAVAILABLE" in last_error or "high demand" in last_error:
+                if attempt < max_retries - 1:
+                    if attempt == 0:
+                        with ApiClient(configuration) as api_client:
+                            MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text="⏳ GoogleのAIサーバーが混雑しています。自動で再接続を試みています...（最大30秒ほどお待ちください）")]))
+                    time.sleep(10)
+                else:
+                    pass
+            else:
+                break
+    
+    if ai_response:
         report_id = str(uuid.uuid4())
-        summary_db[report_id] = {"summary": response.text, "raw_text": combined_text}
+        summary_db[report_id] = {"summary": ai_response.text, "raw_text": combined_text}
         report_url = f"{host_url.rstrip('/')}/report/{report_id}"
         reply_msg = f"✅ 処理が完了しました。\n以下の専用ページからご確認ください。\n{report_url}"
         
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=reply_msg)]))
-    except Exception as e:
+    else:
         with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=f"エラー: {str(e)}")] ))
+            MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=f"❌ サーバーの混雑が解消されませんでした。数分おいて再度お試しください。\nエラー詳細: {last_error}")] ))
 
 @app.route("/", methods=["GET"])
 def health_check(): return "OK"
