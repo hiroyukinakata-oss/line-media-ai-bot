@@ -156,7 +156,6 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
     """
     
     try:
-        # 安定稼働しやすい gemini-1.5-flash に変更
         response = gemini_client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
         report_id = str(uuid.uuid4())
         summary_db[report_id] = {"summary": response.text, "raw_text": combined_text}
@@ -218,3 +217,12 @@ def view_report(report_id):
             const rawText = document.getElementById('raw-markdown').value;
             const rawData = document.getElementById('raw-data').value;
             document.getElementById('content').innerHTML = marked.parse(rawText);
+            function showToast(msg) {
+                const toast = document.getElementById("toast");
+                toast.innerText = msg;
+                toast.className = "show";
+                setTimeout(() => { toast.className = toast.className.replace("show", ""); }, 2000);
+            }
+            function copyText(type) {
+                const text = (type === 'summary') ? rawText : rawData;
+                navigator.clipboard.writeText(text).then(() => { showToast(type === '
