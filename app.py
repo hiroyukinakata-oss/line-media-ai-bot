@@ -156,8 +156,8 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
     """
     
     try:
-        # 正しいモデル名に変更
-        response = gemini_client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+        # エラーメッセージの指示通りに gemini-3.8-flash へ変更
+        response = gemini_client.models.generate_content(model='gemini-3.8-flash', contents=prompt)
         report_id = str(uuid.uuid4())
         summary_db[report_id] = {"summary": response.text, "raw_text": combined_text}
         report_url = f"{host_url.rstrip('/')}/report/{report_id}"
