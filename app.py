@@ -135,4 +135,137 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
         
     if not has_valid_content:
         reply_msg = "⚠️ エラー：有効なテキストデータを取得できませんでした。処理を中断します。"
-        with ApiClient(configuration) as api_
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=reply_msg)]))
+        return
+
+    content_sources.insert(0, f"【システム処理ログ】\n" + "\n".join(trace_log))
+    combined_text = "\n\n".join(content_sources)
+
+    prompt = f"""
+    あなたは優秀なデータアナリスト兼リサーチャーです。
+    以下の抽出データ（Xの投稿、海外YouTube動画の内容、Web記事など）に基づき、誇張や推測を一切排した【事実に基づく正確な要約】を作成してください。
+
+    【抽出データ】
+    {combined_text}
+
+    以下の構成でMarkdown形式で出力してください。
+    # 1. 【事実に基づく要約】動画や投稿で語られている内容の正確な要約（日本語）
+    # 2. 【主要ポイント】具体的に何が解説・主張されているか（箇条書き）
+    # 3. 【抽出データ（生データ）のハイライト】元データから読み取れる重要ファクト
+    """
+    
+    try:
+        response = gemini_client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
+        report_id = str(uuid.uuid4())
+        summary_db[report_id] = {"summary": response.text, "raw_text": combined_text}
+        report_url = f"{host_url.rstrip('/')}/report/{report_id}"
+        reply_msg = f"✅ 処理が完了しました。\n以下の専用ページからご確認ください。\n{report_url}"
+        
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=reply_msg)]))
+    except Exception as e:
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=f"エラー: {str(e)}")] ))
+
+@app.route("/", methods=["GET"])
+def health_check(): return "OK"
+
+@app.route("/report/<report_id>", methods=["GET"])
+def view_report(report_id):
+    data = summary_db.get(report_id)
+    if not data: return "<h1>レポートが見つかりません。</h1>", 404
+    template = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>動画・投稿 要約 & 生データ抽出</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        body { font-family: sans-serif; line-height: 1.8; padding: 15px; max-width: 900px; margin: 0 auto; background: #f4f7f6; color: #333;}
+        .container { background: #fff; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); margin-bottom: 20px;}
+        .action-card { background: #e8f5e9; border: 2px solid #a5d6a7; border-radius: 10px; padding: 15px; margin-bottom: 20px; }
+        .action-title { font-weight: bold; font-size: 1.05em; color: #1b5e20; margin-bottom: 10px; }
+        .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+        .btn { display: block; text-align: center; padding: 10px 8px; border-radius: 6px; font-weight: bold; font-size: 0.9em; text-decoration: none; cursor: pointer; border: none; transition: 0.2s; }
+        .btn-primary { background: #2e7d32; color: #fff; }
+        .btn-secondary { background: #37474f; color: #fff; }
+        .btn-outline { background: #fff; color: #2e7d32; border: 1px solid #2e7d32; }
+        h1 { font-size: 1.4em; border-bottom: 3px solid #3498db; padding-bottom: 8px; margin-top: 30px; color: #2c3e50;}
+        h2 { font-size: 1.2em; border-left: 5px solid #3498db; padding-left: 12px; margin-top: 25px; color: #34495e;}
+        #toast { visibility: hidden; min-width: 200px; background-color: #333; color: #fff; text-align: center; border-radius: 8px; padding: 12px; position: fixed; z-index: 9999; left: 50%; bottom: 30px; transform: translateX(-50%); font-size: 0.9em;}
+        #toast.show { visibility: visible; }
+    </style>
+</head>
+<body>
+    <div class="action-card">
+        <div class="action-title">⚡ アクションメニュー（AIへの取り込み用）</div>
+        <div class="btn-grid">
+            <button class="btn btn-primary" onclick="copyText('summary')">📋 要約をコピー</button>
+            <button class="btn btn-secondary" onclick="copyText('raw')">📋 生データをコピー</button>
+            <a class="btn btn-outline" href="/download/{{ report_id }}/txt" target="_blank">📄 要約 (.txt) 保存</a>
+            <a class="btn btn-outline" href="/download/{{ report_id }}/raw" target="_blank">📦 生データ 保存</a>
+        </div>
+    </div>
+    <div class="container" id="content"></div>
+    <div id="toast">コピーしました！</div>
+    <textarea id="raw-markdown" style="display:none;">{{ summary }}</textarea>
+    <textarea id="raw-data" style="display:none;">{{ raw_text }}</textarea>
+    <script>
+        const rawText = document.getElementById('raw-markdown').value;
+        const rawData = document.getElementById('raw-data').value;
+        document.getElementById('content').innerHTML = marked.parse(rawText);
+        function showToast(msg) {
+            const toast = document.getElementById("toast");
+            toast.innerText = msg;
+            toast.className = "show";
+            setTimeout(() => { toast.className = toast.className.replace("show", ""); }, 2000);
+        }
+        function copyText(type) {
+            const text = (type === 'summary') ? rawText : rawData;
+            navigator.clipboard.writeText(text).then(() => { showToast(type === 'summary' ? "要約テキストをコピーしました！" : "生データをコピーしました！"); });
+        }
+    </script>
+</body>
+</html>"""
+    return render_template_string(template, report_id=report_id, summary=data["summary"], raw_text=data["raw_text"])
+
+@app.route("/download/<report_id>/<file_type>", methods=["GET"])
+def download_file(report_id, file_type):
+    data = summary_db.get(report_id)
+    if not data: return "Not Found", 404
+    if file_type == "txt":
+        content = data["summary"].replace("#", "").replace("*", "")
+        filename = "summary.txt"
+    elif file_type == "raw":
+        content = data["raw_text"]
+        filename = "raw_data.txt"
+    else: return "Bad Request", 400
+    response = Response(content, mimetype="text/plain; charset=utf-8")
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
+
+@app.route("/callback", methods=["POST"])
+def callback():
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
+    return "OK"
+
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_message(event):
+    user_text = event.message.text.strip()
+    if not user_text.startswith("http"):
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text="動画や記事のURLを送信してください。")]))
+        return
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text="🔍 動画・投稿データを抽出・要約中です...\n少々お待ちください。")]))
+    threading.Thread(target=async_process_ai, args=(event.source.user_id, user_text, request.host_url)).start()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
