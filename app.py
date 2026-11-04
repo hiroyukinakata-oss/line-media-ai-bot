@@ -39,26 +39,24 @@ def extract_x_data(url: str):
     text = ""
     expanded_urls = []
     try:
-        parsed = urlparse(url)
-        if parsed.netloc in ["twitter.com", "x.com", "www.twitter.com", "www.x.com"]:
-            clean_path = parsed.path
-            api_url = f"https://api.vxtwitter.com{clean_path}"
-            with requests.get(api_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10) as res:
-                if res.status_code == 200:
-                    try:
-                        data = res.json()
-                        text = data.get("text", "")
-                        if "qrtURL" in data: text += f" {data['qrtURL']}"
-                        raw_urls = re.findall(r'(https?://[^\s]+)', text)
-                        for r_url in raw_urls:
-                            r_url = r_url.rstrip(').,;!?')
-                            e_url = get_expanded_url(r_url)
-                            if e_url not in expanded_urls:
-                                expanded_urls.append(e_url)
-                    except ValueError:
-                        pass
-    except Exception:
-        pass
+        jina_url = f"https://r.jina.ai/{url}"
+        headers = {
+            "Accept": "text/plain",
+            "X-Return-Format": "markdown",
+            "X-No-Cache": "true"
+        }
+        res = requests.get(jina_url, headers=headers, timeout=25)
+        if res.status_code == 200:
+            text = res.text
+            raw_urls = re.findall(r'(https?://[^\s]+)', text)
+            for r_url in raw_urls:
+                r_url = r_url.rstrip(').,;!?*')
+                if 't.co' in r_url or 'youtube' in r_url or 'youtu.be' in r_url:
+                    e_url = get_expanded_url(r_url)
+                    if e_url not in expanded_urls and e_url != url:
+                        expanded_urls.append(e_url)
+    except Exception as e:
+        text = f"（※Xデータ抽出エラー: {str(e)}）"
     return text, expanded_urls
 
 def scrape_webpage(url: str) -> str:
@@ -75,7 +73,7 @@ def scrape_webpage(url: str) -> str:
             res.encoding = res.apparent_encoding
             soup = BeautifulSoup(res.text, 'html.parser')
             return soup.get_text(separator=' ', strip=True)
-    except Exception as e: # ← ここを修正しました (as e)
+    except Exception as e:
         return f"（※記事の取得に失敗しました: {str(e)}）"
 
 def get_youtube_transcript(url: str) -> str:
@@ -101,12 +99,11 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
     content_sources = []
     trace_log = [] 
     has_valid_content = False
-    critical_error_msg = None
     
     if "x.com" in original_url or "twitter.com" in original_url:
         x_text, extracted_urls = extract_x_data(original_url)
         if x_text and not x_text.startswith("（※"):
-            content_sources.append(f"【Xの英語投稿内容】\n{x_text}")
+            content_sources.append(f"【Xの投稿内容】\n{x_text}")
             has_valid_content = True
         trace_log.append(f"🔍 検出された内部URL: {extracted_urls}")
         
@@ -114,9 +111,7 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
             if 'youtu' in url or 'youtube.com' in url:
                 trace_log.append(f"▶ YouTubeデータ抽出: {url}")
                 ts = get_youtube_transcript(url)
-                if ts.startswith("（※"):
-                    critical_error_msg = ts
-                else:
+                if not ts.startswith("（※"):
                     content_sources.append(f"【動画データ({url})】\n{ts[:300000]}")
                     has_valid_content = True
             else:
@@ -129,9 +124,7 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
         trace_log.append(f"🔍 直接入力されたURL: {original_url}")
         if 'youtu' in original_url or 'youtube.com' in original_url:
             ts = get_youtube_transcript(original_url)
-            if ts.startswith("（※"):
-                critical_error_msg = ts
-            else:
+            if not ts.startswith("（※"):
                 content_sources.append(f"【動画データ({original_url})】\n{ts[:300000]}")
                 has_valid_content = True
         else:
@@ -139,12 +132,6 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
             if not text.startswith("（※"):
                 content_sources.append(f"【記事内容({original_url})】\n{text[:100000]}")
                 has_valid_content = True
-
-    if critical_error_msg:
-        reply_msg = f"⚠️ エラー：動画データの取得に失敗しました。\n詳細: {critical_error_msg}\n\n※事実に基づかない推測レポートの作成を防ぐため、処理を中断しました。"
-        with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[TextMessage(text=reply_msg)]))
-        return
         
     if not has_valid_content:
         reply_msg = "⚠️ エラー：有効なテキストデータを取得できませんでした。処理を中断します。"
@@ -156,19 +143,16 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
     combined_text = "\n\n".join(content_sources)
 
     prompt = f"""
-    あなたは海外の最新AIトレンドを解析し、事業実装をサポートする専門エージェントです。
-    以下の抽出データ（Xの英語投稿、海外YouTube動画の内容、Web記事など）を読み解き、英語の一次情報を完全に日本語化・体系化した【深掘り解説レポート】を作成してください。
-
-    特に、この情報を「越境ECや無在庫販売システム（eBay/Shopee等）の半自動化、およびAIエージェントを活用した事業効率化」にどのように応用できるかという視点を必ず盛り込んでください。
+    あなたは優秀なデータアナリスト兼リサーチャーです。
+    以下の抽出データ（Xの投稿、海外YouTube動画の内容、Web記事など）に基づき、誇張や推測を一切排した【事実に基づく正確な要約】を作成してください。
 
     【抽出データ】
     {combined_text}
 
     以下の構成でMarkdown形式で出力してください。
-    # 1. 【要約】この情報が伝えたかった最大のテーマ（日本語訳）
-    # 2. 【詳細解説】動画や記事で具体的に何が語られていたか？（重要ポイントと手法の徹底解剖）
-    # 3. 【事業応用】EC半自動化やAIエージェント構築への具体的な活用アイデア・ヒント
-    # 4. 今後のアクション・まとめ
+    # 1. 【事実に基づく要約】動画や投稿で語られている内容の正確な要約（日本語）
+    # 2. 【主要ポイント】具体的に何が解説・主張されているか（箇条書き）
+    # 3. 【抽出データ（生データ）のハイライト】元データから読み取れる重要ファクト
     """
     
     try:
@@ -197,7 +181,7 @@ def view_report(report_id):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>AI 事業応用解説レポート</title>
+        <title>動画・投稿 要約 & 生データ抽出</title>
         <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
         <style>
             body { font-family: sans-serif; line-height: 1.8; padding: 15px; max-width: 900px; margin: 0 auto; background: #f4f7f6; color: #333;}
@@ -217,7 +201,7 @@ def view_report(report_id):
     </head>
     <body>
         <div class="action-card">
-            <div class="action-title">⚡ アクションメニュー</div>
+            <div class="action-title">⚡ アクションメニュー（AIへの取り込み用）</div>
             <div class="btn-grid">
                 <button class="btn btn-primary" onclick="copyText('summary')">📋 要約をコピー</button>
                 <button class="btn btn-secondary" onclick="copyText('raw')">📋 生データをコピー</button>
@@ -255,10 +239,10 @@ def download_file(report_id, file_type):
     if not data: return "Not Found", 404
     if file_type == "txt":
         content = data["summary"].replace("#", "").replace("*", "")
-        filename = "ai_summary.txt"
+        filename = "summary.txt"
     elif file_type == "raw":
         content = data["raw_text"]
-        filename = "raw_extracted_data.txt"
+        filename = "raw_data.txt"
     else: return "Bad Request", 400
     response = Response(content, mimetype="text/plain; charset=utf-8")
     response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
@@ -268,8 +252,10 @@ def download_file(report_id, file_type):
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
-    try: handler.handle(body, signature)
-    except InvalidSignatureError: abort(400)
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
     return "OK"
 
 @handler.add(MessageEvent, message=TextMessageContent)
@@ -280,7 +266,7 @@ def handle_message(event):
             MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text="動画や記事のURLを送信してください。")]))
         return
     with ApiClient(configuration) as api_client:
-        MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text="🔍 大元の動画・記事のデータを読み込み、徹底解説レポートを作成中です...\n（非常に深い内容を生成するため、1分〜2分ほどかかります。少々お待ちください）")]))
+        MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text="🔍 動画・投稿データを抽出・要約中です...\n少々お待ちください。")]))
     threading.Thread(target=async_process_ai, args=(event.source.user_id, user_text, request.host_url)).start()
 
 if __name__ == "__main__":
