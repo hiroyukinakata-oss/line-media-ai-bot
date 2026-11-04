@@ -156,7 +156,8 @@ def async_process_ai(user_id: str, original_url: str, host_url: str):
     """
     
     try:
-        response = gemini_client.models.generate_content(model='gemini-3.6-flash', contents=prompt)
+        # 安定稼働しやすい gemini-1.5-flash に変更
+        response = gemini_client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
         report_id = str(uuid.uuid4())
         summary_db[report_id] = {"summary": response.text, "raw_text": combined_text}
         report_url = f"{host_url.rstrip('/')}/report/{report_id}"
@@ -217,57 +218,3 @@ def view_report(report_id):
             const rawText = document.getElementById('raw-markdown').value;
             const rawData = document.getElementById('raw-data').value;
             document.getElementById('content').innerHTML = marked.parse(rawText);
-            function showToast(msg) {
-                const toast = document.getElementById("toast");
-                toast.innerText = msg;
-                toast.className = "show";
-                setTimeout(() => { toast.className = toast.className.replace("show", ""); }, 2000);
-            }
-            function copyText(type) {
-                const text = (type === 'summary') ? rawText : rawData;
-                navigator.clipboard.writeText(text).then(() => { showToast(type === 'summary' ? "要約テキストをコピーしました！" : "生データをコピーしました！"); });
-            }
-        </script>
-    </body>
-    </html>
-    """
-    return render_template_string(template, report_id=report_id, summary=data["summary"], raw_text=data["raw_text"])
-
-@app.route("/download/<report_id>/<file_type>", methods=["GET"])
-def download_file(report_id, file_type):
-    data = summary_db.get(report_id)
-    if not data: return "Not Found", 404
-    if file_type == "txt":
-        content = data["summary"].replace("#", "").replace("*", "")
-        filename = "summary.txt"
-    elif file_type == "raw":
-        content = data["raw_text"]
-        filename = "raw_data.txt"
-    else: return "Bad Request", 400
-    response = Response(content, mimetype="text/plain; charset=utf-8")
-    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
-    return response
-
-@app.route("/callback", methods=["POST"])
-def callback():
-    signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
-    return "OK"
-
-@handler.add(MessageEvent, message=TextMessageContent)
-def handle_message(event):
-    user_text = event.message.text.strip()
-    if not user_text.startswith("http"):
-        with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text="動画や記事のURLを送信してください。")]))
-        return
-    with ApiClient(configuration) as api_client:
-        MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text="🔍 動画・投稿データを抽出・要約中です...\n少々お待ちください。")]))
-    threading.Thread(target=async_process_ai, args=(event.source.user_id, user_text, request.host_url)).start()
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
